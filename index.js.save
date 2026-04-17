@@ -1,0 +1,935 @@
+const express = require("express")
+const P = require("pino")
+const qrcode = require("qrcode-terminal")
+const axios = require("axios")
+const fs = require("fs")
+const path = require("path")
+const mysql = require("mysql2/promise")
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  downloadMediaMessage
+} = require("@whiskeysockets/baileys")
+
+const app = express()
+app.use(express.json())
+
+/** Debe coincidir con Gunicorn (p. ej. tuexpo.service -b 127.0.0.1:5000). Antes estaba 5001 y Flask nunca recibía el webhook. */
+const TUEXPO_WHATSAPP_INCOMING_URL =
+  process.env.TUEXPO_WHATSAPP_INCOMING_URL ||
+  "http://127.0.0.1:5000/whatsapp/incoming"
+
+// Multi-tenant runtime stores.
+const sessions = {} // { [companyId]: sock }
+const qrStore = {} // { [companyId]: qrString|null }
+const statusStore = {} // { [companyId]: connected|disconnected|waiting_qr|connecting|unknown }
+const qrUpdatedAtStore = {} // { [companyId]: msTimestamp }
+const connectInProgress = {} // { [companyId]: boolean }
+
+function resolveTenant(receiverNumber) {
+  const TENANT_MAP = {
+    "5212215977938": 2,   // sandbox Mexico (Brain Menz test)
+    "5531988096458": 2,   // numero real Menz (activar despues)
+  }
+
+  return TENANT_MAP[receiverNumber] || 1 // Clinicas default seguro
+}
+
+function normalizeMxDigits(phone) {
+  const p = String(phone || "").replace(/\D/g, "")
+  if (p.startsWith("521") && p.length === 13) {
+    return "52" + p.slice(3)
+  }
+  return p
+}
+
+function resolveCanonicalChatJid(remoteJid, companyId) {
+  const jid = String(remoteJid || "").trim()
+  if (!jid) return jid
+  if (jid.endsWith("@s.whatsapp.net")) return jid
+  if (!jid.endsWith("@lid")) return jid
+
+  const lid = jid.replace("@lid", "").trim()
+  if (!lid) return jid
+
+  // Baileys session mapping: lid-mapping-<lid>_reverse.json contains the phone number.
+  const reversePath = path.join(__dirname, "sessions", String(companyId), `lid-mapping-${lid}_reverse.json`)
+  try {
+    if (fs.existsSync(reversePath)) {
+      const raw = fs.readFileSync(reversePath, "utf8").trim()
+      const phone = String(JSON.parse(raw) || "").replace(/\D/g, "")
+      if (phone) return `${phone}@s.whatsapp.net`
+    }
+  } catch (e) {
+    console.log("WARN lid reverse mapping failed:", e.message)
+  }
+  return jid
+}
+
+function inferAffiliateBrandFromCaption(caption) {
+  const t = String(caption || "")
+  if (/mizuno/i.test(t)) return "mizuno"
+  if (/olympikus/i.test(t)) return "olympikus"
+  return "unknown"
+}
+
+function parseAffiliateProductCaption(caption) {
+  const lines = String(caption || "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const model = lines[0] || ""
+  let price = ""
+  let link = ""
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (/^r\$\s*/i.test(line)) {
+      price = line.replace(/^r\$\s*/i, "").trim()
+    } else if (/^https?:\/\//i.test(line)) {
+      link = line
+    }
+  }
+  return { model, price, link }
+}
+
+async function saveMessageToDb(
+  phone,
+  direction,
+  body,
+  source,
+  tenantId,
+  mediaType = null,
+  mediaUrl = null,
+  metaJson = null
+) {
+  if (!phone) return
+  const msgBody =
+    body != null && String(body).trim() !== ""
+      ? String(body)
+      : mediaUrl
+        ? "[media]"
+        : ""
+  if (!msgBody && !mediaUrl) return
+  let db
+  try {
+    db = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+      database: "tuexpo_voice",
+    })
+    await db.execute(
+      `INSERT INTO messages (phone, tenant_id, direction, message, source, media_type, media_url, meta_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [phone, tenantId, direction, msgBody, source, mediaType, mediaUrl, metaJson]
+    )
+  } catch (err) {
+    console.warn(`${direction}bound message DB save failed`, err.message || err)
+  } finally {
+    if (db) await db.end()
+  }
+}
+
+async function streamToBuffer(stream) {
+  const chunks = []
+  for await (const chunk of stream) {
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+async function persistIncomingMedia(sockInstance, msgData, tenantId) {
+  const empty = {
+    mediaType: null,
+    mediaUrl: null,
+    mimeType: null,
+    ptt: null,
+    mediaBase64: null,
+  }
+  try {
+    const m = msgData?.message
+    if (!m) return { ...empty }
+
+    let mediaType = null
+    let content = null
+    if (m.imageMessage) {
+      mediaType = "image"
+      content = m.imageMessage
+    } else if (m.stickerMessage) {
+      mediaType = "sticker"
+      content = m.stickerMessage
+    } else if (m.ptvMessage) {
+      mediaType = "video"
+      content = m.ptvMessage
+    } else if (m.videoMessage) {
+      mediaType = "video"
+      content = m.videoMessage
+    } else if (m.pttMessage) {
+      mediaType = "audio"
+      content = m.pttMessage
+    } else if (m.audioMessage) {
+      mediaType = "audio"
+      content = m.audioMessage
+    } else if (m.documentMessage) {
+      mediaType = "document"
+      content = m.documentMessage
+    } else {
+      return { ...empty }
+    }
+
+    const absDir = path.join("/opt/tuexpo_panel/static", "wa_media", String(tenantId))
+    await fs.promises.mkdir(absDir, { recursive: true })
+
+    const extFromMime = (mime) => {
+      const mm = String(mime || "").toLowerCase()
+      if (mm.includes("jpeg")) return "jpg"
+      if (mm.includes("png")) return "png"
+      if (mm.includes("webp")) return "webp"
+      if (mm.includes("ogg") || mm.includes("opus")) return "ogg"
+      if (mm.includes("mp3")) return "mp3"
+      if (mm.includes("mp4")) return "mp4"
+      if (mm.includes("pdf")) return "pdf"
+      return "bin"
+    }
+
+    const mime = content?.mimetype
+    const ext = extFromMime(mime)
+    const fname = `${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`
+    const absPath = path.join(absDir, fname)
+
+    const dlLogger = sockInstance?.logger || P({ level: "silent" })
+    const reupload =
+      typeof sockInstance?.updateMediaMessage === "function" ? sockInstance.updateMediaMessage.bind(sockInstance) : undefined
+
+    let buffer = null
+    try {
+      buffer = await downloadMediaMessage(
+        msgData,
+        "buffer",
+        {},
+        { logger: dlLogger, reuploadRequest: reupload }
+      )
+    } catch (e1) {
+      // Algunos mensajes solo traen directPath (sin url); downloadMediaMessage falla antes de descargar.
+      console.warn("downloadMediaMessage failed, fallback directPath:", e1?.message || e1)
+      const { downloadContentFromMessage } = await import("@whiskeysockets/baileys/lib/Utils/messages-media.js")
+      const dlKind =
+        mediaType === "sticker"
+          ? "sticker"
+          : mediaType === "video" && m.ptvMessage
+            ? "ptv"
+            : mediaType === "audio" && content?.ptt
+              ? "ptt"
+              : mediaType === "image"
+                ? "image"
+                : mediaType === "video"
+                  ? "video"
+                  : mediaType === "audio"
+                    ? "audio"
+                    : mediaType === "document"
+                      ? "document"
+                      : "image"
+      const stream = await downloadContentFromMessage(content, dlKind, {})
+      buffer = await streamToBuffer(stream)
+    }
+
+    await fs.promises.writeFile(absPath, buffer)
+
+    const mediaUrl = `/static/wa_media/${tenantId}/${fname}`
+
+    let mimeType = null
+    let ptt = null
+    let mediaBase64 = null
+    if (mediaType === "audio" && buffer) {
+      mimeType = String(content?.mimetype || "audio/ogg; codecs=opus").trim() || "audio/ogg; codecs=opus"
+      ptt = !!(content?.ptt || m.pttMessage)
+      mediaBase64 = buffer.toString("base64")
+    }
+
+    return { mediaType, mediaUrl, mimeType, ptt, mediaBase64 }
+  } catch (e) {
+    console.warn("persistIncomingMedia failed", e?.message || e)
+    return { ...empty }
+  }
+}
+
+async function saveContactPushName(phone, pushName, tenantId) {
+  if (!phone || !pushName) return
+  let db
+  try {
+    db = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+      database: "tuexpo_voice",
+    })
+    await db.execute(
+      `INSERT INTO contacts (phone, tenant_id, push_name, name)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         tenant_id = VALUES(tenant_id),
+         push_name = VALUES(push_name),
+         name = IF(CHAR_LENGTH(TRIM(COALESCE(name, ''))) = 0, VALUES(name), name)`,
+      [phone, tenantId, pushName, pushName]
+    )
+  } catch (err) {
+    console.warn("contact push_name save failed", err.message || err)
+  } finally {
+    if (db) await db.end()
+  }
+}
+
+/** Evita pedir la foto a WA en cada mensaje (mismo contacto). */
+const profilePicFetchCooldown = new Map()
+const PROFILE_PIC_COOLDOWN_MS = 6 * 60 * 60 * 1000
+
+async function saveContactProfilePicUrl(sockInstance, phone, jidForPicture, tenantId) {
+  if (!phone || !jidForPicture || !sockInstance) return
+
+  const now = Date.now()
+  const lastOk = profilePicFetchCooldown.get(phone)
+  if (lastOk && now - lastOk < PROFILE_PIC_COOLDOWN_MS) return
+
+  let url
+  try {
+    url = await sockInstance.profilePictureUrl(jidForPicture, "image")
+  } catch (err) {
+    console.warn("profilePictureUrl failed", phone, err.message || err)
+    return
+  }
+
+  if (!url) return
+
+  profilePicFetchCooldown.set(phone, now)
+
+  let db
+  try {
+    db = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+      database: "tuexpo_voice",
+    })
+    await db.execute(
+      `INSERT INTO contacts (phone, tenant_id, profile_pic_url)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         tenant_id = VALUES(tenant_id),
+         profile_pic_url = VALUES(profile_pic_url)`,
+      [phone, tenantId, url]
+    )
+  } catch (err) {
+    console.warn("contact profile_pic_url save failed", err.message || err)
+  } finally {
+    if (db) await db.end()
+  }
+}
+
+function tenantFromRequest(req) {
+  const raw = req.body?.company_id ?? req.query?.company_id ?? 1
+  const n = parseInt(String(raw), 10)
+  return Number.isFinite(n) && n > 0 ? n : 1
+}
+
+async function startWhatsApp(companyId, forceNew = false) {
+  const tenantId = parseInt(String(companyId), 10) || 1
+  const sessionDir = path.join(__dirname, "sessions", String(tenantId))
+  await fs.promises.mkdir(sessionDir, { recursive: true })
+
+  if (forceNew) {
+    try {
+      await fs.promises.unlink(path.join(sessionDir, "creds.json"))
+    } catch (e) {
+      // ignore if creds do not exist
+    }
+  }
+
+  if (sessions[tenantId]) {
+    try {
+      await sessions[tenantId].logout()
+    } catch (e) {
+      // ignore
+    }
+    sessions[tenantId] = null
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
+
+  const { version } = await fetchLatestBaileysVersion()
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: P({ level: "silent" }),
+    browser: ["Tuexpo Voice", "Chrome", "1.0.0"]
+  })
+
+  sessions[tenantId] = sock
+  statusStore[tenantId] = statusStore[tenantId] || "connecting"
+  sock.ev.on("creds.update", saveCreds)
+
+  sock.ev.on("connection.update", (update) => {
+
+    const { connection, qr, lastDisconnect } = update
+
+    if (qr) {
+      qrStore[tenantId] = qr
+      qrUpdatedAtStore[tenantId] = Date.now()
+      statusStore[tenantId] = "waiting_qr"
+      console.log("\nESCANEA ESTE QR\n")
+      qrcode.generate(qr, { small: true })
+    }
+
+    if (connection === "open") {
+      console.log(`WhatsApp conectado correctamente (tenant ${tenantId})`)
+      statusStore[tenantId] = "connected"
+      qrStore[tenantId] = null
+      qrUpdatedAtStore[tenantId] = Date.now()
+    }
+
+    if (connection === "close") {
+
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+
+      console.log(`Conexión cerrada (tenant ${tenantId})`)
+      statusStore[tenantId] = "disconnected"
+
+      if (shouldReconnect) {
+        setTimeout(() => {
+          startWhatsApp(tenantId, false).catch((err) => {
+            console.error(`reconnect failed tenant ${tenantId}:`, err.message || err)
+          })
+        }, 1000)
+      }
+    }
+  })
+
+  function normalizeMx(phone) {
+    if (!phone) return phone
+    if (phone.startsWith("521") && phone.length === 13) {
+      return "52" + phone.slice(3)
+    }
+    return phone
+  }
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return
+
+    const msgData = messages?.[0]
+    if (!msgData || !msgData.message) return
+
+    const m = msgData.message
+
+    // DETECTAR RESPUESTA CITADA A PRODUCTO
+    const quotedId =
+      m?.extendedTextMessage?.contextInfo?.stanzaId ||
+      m?.imageMessage?.contextInfo?.stanzaId ||
+      m?.videoMessage?.contextInfo?.stanzaId ||
+      m?.documentMessage?.contextInfo?.stanzaId ||
+      null
+
+    if (quotedId) {
+      console.log("[MENZ QUOTED PRODUCT DETECTED]", quotedId)
+    }
+
+    const rawText =
+      m.conversation ||
+      m.extendedTextMessage?.text ||
+      m.imageMessage?.caption ||
+      m.videoMessage?.caption ||
+      m.documentMessage?.caption ||
+      ""
+
+    const hasMedia = !!(
+      m.imageMessage ||
+      m.videoMessage ||
+      m.audioMessage ||
+      m.pttMessage ||
+      m.stickerMessage ||
+      m.documentMessage ||
+      m.ptvMessage
+    )
+
+    const remoteJid = msgData.key.remoteJid || ""
+    const fromMe = !!msgData.key.fromMe
+    const participant = msgData.key.participant || ""
+    // permitir que mensajes enviados desde operador también se envíen al backend
+    // (evitamos loops en Flask, no aquí)
+
+
+    // Tenant/company must always come from the active WA session (never from JID/LID).
+    const sessionCompanyId = Number(tenantId) || 1
+
+    // Salientes (fromMe): remoteJid suele ser @lid del chat; el peer real viene en participant.
+    const chatSourceJid = fromMe && participant ? participant : remoteJid
+    const webhookChatJid = resolveCanonicalChatJid(chatSourceJid, sessionCompanyId)
+
+    const operatorNumber = (process.env.WHATSAPP_OPERATOR_NUMBER || "").replace(/\D/g, "")
+    const operatorJid = operatorNumber ? `${operatorNumber}@s.whatsapp.net` : ""
+    const rawSender =
+      fromMe
+        ? (operatorJid || remoteJid)
+        : (remoteJid === "status@broadcast" ? participant : remoteJid)
+    const sender = normalizeMxDigits(normalizeMx((rawSender || "").split("@")[0] || ""))
+    const phone = normalizeMxDigits(
+      String(webhookChatJid || chatSourceJid || sender || "").replace(/\D/g, "")
+    )
+    const message = String(rawText || "")
+
+    const textNorm = String(message).trim().toLowerCase()
+    const isControlCommand = ["activar", "ativar", "desactivar", "desativar"].includes(textNorm)
+    // Ignore outgoing bot/operator messages unless they are explicit control commands.
+    if (false && fromMe && !isControlCommand) {
+      let db
+      try {
+        db = await mysql.createConnection({
+          host: "localhost",
+          user: "root",
+          password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+          database: "tuexpo_voice",
+        })
+        await db.execute(
+          `INSERT INTO messages (phone, tenant_id, direction, message, source)
+           VALUES (?, ?, ?, ?, ?)`,
+          [phone, sessionCompanyId, "out", message || "", "mobile"]
+        )
+      } catch (err) {
+        console.error("outbound message DB save failed", err.message)
+      } finally {
+        if (db) await db.end()
+      }
+
+      return
+    }
+
+    if (
+      remoteJid === "status@broadcast" ||
+      remoteJid.endsWith("@g.us") ||
+      remoteJid.includes("newsletter")
+    ) {
+      return
+    }
+
+    const textForBrain = String(message || "").trim() || (hasMedia ? "[media]" : "")
+    if (!textForBrain) {
+      return
+    }
+
+    console.log("CHAT DETECTADO:", remoteJid)
+    console.log("CHAT PARTICIPANT:", participant)
+    if (webhookChatJid !== chatSourceJid) {
+      console.log("CHAT NORMALIZED:", webhookChatJid, "src:", chatSourceJid)
+    }
+
+    // 🔥 BLOQUEO DEL GRUPO
+    if (remoteJid?.includes("120363406188468587")) {
+      console.log("🚫 BLOQUEADO:", remoteJid)
+      return
+    }
+
+    console.log("MENSAJE ENTRANTE:", textForBrain)
+
+    const pushName = String(msgData.pushName || "").trim()
+    if (!fromMe && phone && pushName) {
+      await saveContactPushName(phone, pushName, sessionCompanyId)
+    }
+
+    if (!fromMe && phone && webhookChatJid && !webhookChatJid.endsWith("@g.us")) {
+      void saveContactProfilePicUrl(sock, phone, webhookChatJid, sessionCompanyId).catch((e) =>
+        console.warn("saveContactProfilePicUrl", e.message || e)
+      )
+    }
+
+    // Persist inbound WhatsApp messages to DB (non-fatal on errors).
+    let persist = { mediaType: null, mediaUrl: null, mimeType: null, ptt: null, mediaBase64: null }
+    if (!fromMe && phone && textForBrain) {
+      persist = await persistIncomingMedia(sock, msgData, sessionCompanyId)
+      await saveMessageToDb(phone, "in", textForBrain, "client", sessionCompanyId, persist.mediaType, persist.mediaUrl)
+    }
+
+    try {
+      const webhookPhone = normalizeMxDigits(
+        String(webhookChatJid || phone || sender || "").replace(/\D/g, "")
+      )
+      console.log("→ Enviando a Flask...", TUEXPO_WHATSAPP_INCOMING_URL)
+      const logPayload = {
+        company_id: sessionCompanyId,
+        tenant_id: sessionCompanyId,
+        sender,
+        remoteJid: webhookChatJid,
+        rawRemoteJid: remoteJid,
+      }
+      if (persist.mediaType === "audio" && persist.mediaBase64) {
+        logPayload.media_type = "audio"
+        logPayload.mime_type = persist.mimeType
+        logPayload.ptt = persist.ptt
+        logPayload.media_base64 = `<${persist.mediaBase64.length} chars>`
+      }
+      console.log("WEBHOOK PAYLOAD:", logPayload)
+      const flaskBody = {
+        phone: webhookPhone || sender,
+        sender,
+        remoteJid: webhookChatJid,
+        rawRemoteJid: remoteJid,
+        key: { remoteJid: webhookChatJid },
+        tenant_id: sessionCompanyId,
+        company_id: sessionCompanyId,
+        participant,
+        fromMe,
+        text: textForBrain,
+        message: textForBrain,
+        quoted_id: quotedId,
+        catalog_stanza_ids: global.catalogMessageIds || [],
+      }
+      if (persist.mediaType === "audio" && persist.mediaBase64) {
+        flaskBody.media_type = "audio"
+        flaskBody.mime_type = persist.mimeType || "audio/ogg; codecs=opus"
+        flaskBody.media_base64 = persist.mediaBase64
+        flaskBody.ptt = persist.ptt === true
+      }
+      const res = await axios.post(TUEXPO_WHATSAPP_INCOMING_URL, flaskBody)
+
+
+      console.log("← Respuesta de Flask:", res.data)
+      const reply = res.data?.response
+
+      if (!reply) return
+
+      // Operator control commands are internal. Do not show these acks to the client chat.
+      const controlAcks = new Set([
+        "Automatización desactivada.",
+        "Automatización activada.",
+        "Automação ativada.",
+      ])
+      if (fromMe && isControlCommand && controlAcks.has(String(reply).trim())) {
+        console.log("↷ Control ACK suppressed from client chat")
+        return
+      }
+
+      function catalogImageCaption(name, priceRaw) {
+        const nameStr = String(name || "Produto")
+        const p = priceRaw != null && priceRaw !== "" ? String(priceRaw).trim() : ""
+        let caption
+        if (!p || p === "-") {
+          caption = nameStr
+        } else if (/^r\$/i.test(p)) {
+          caption = `${nameStr}\n${p}`
+        } else {
+          caption = `${nameStr}\nR$ ${p}`
+        }
+        return caption
+      }
+
+      async function sendWhatsappImage(imageUrl, caption, opts = {}) {
+        const msg = await sessions[sessionCompanyId]?.sendMessage(
+          msgData.key.remoteJid,
+          {
+            image: { url: imageUrl },
+            caption: String(caption || ""),
+          }
+        )
+
+        const stanzaId =
+          msg?.key?.id ||
+          msg?.messages?.[0]?.key?.id ||
+          null
+
+        if (stanzaId) {
+          if (!global.catalogMessageIds) {
+            global.catalogMessageIds = []
+          }
+
+          global.catalogMessageIds.push(stanzaId)
+        }
+
+        const isAffiliate = Boolean(opts && opts.affiliate)
+        const isCatalog = Boolean(opts && opts.catalog)
+        const mediaType = isAffiliate ? "affiliate_product" : "image"
+        /** @type {Record<string, unknown>} */
+        const metaObj = {}
+        if (stanzaId) {
+          metaObj.stanza_id = stanzaId
+        }
+        if (isAffiliate) {
+          const brand =
+            typeof opts.brand === "string" && opts.brand
+              ? opts.brand
+              : inferAffiliateBrandFromCaption(caption)
+          const { model, price, link } = parseAffiliateProductCaption(caption)
+          Object.assign(metaObj, {
+            affiliate: true,
+            source: opts.source || "vtex",
+            brand,
+            model,
+            price_brl: price,
+            link,
+            image_url: imageUrl,
+            persisted_at: new Date().toISOString(),
+          })
+        } else if (isCatalog && opts.catalogItem) {
+          const it = opts.catalogItem
+          const nm = String(it?.name || "").trim() || undefined
+          const pr = it?.price != null && it.price !== "" ? String(it.price) : undefined
+          Object.assign(metaObj, {
+            model: nm,
+            name: nm,
+            price_brl: pr,
+            image_url: imageUrl,
+            link: it?.link ? String(it.link) : undefined,
+          })
+        }
+        const metaJson =
+          Object.keys(metaObj).length > 0 ? JSON.stringify(metaObj) : null
+        await saveMessageToDb(
+          phone,
+          "out",
+          caption || "(imagem)",
+          "ai",
+          sessionCompanyId,
+          mediaType,
+          imageUrl,
+          metaJson
+        )
+      }
+
+      if (reply && typeof reply === "object" && reply.type === "catalog" && Array.isArray(reply.items)) {
+        if (reply.preface) {
+          const pre = String(reply.preface).trim()
+          if (pre) {
+            await sessions[sessionCompanyId]?.sendMessage(msgData.key.remoteJid, { text: pre })
+            await saveMessageToDb(phone, "out", pre, "ai", sessionCompanyId, null, null)
+          }
+        }
+        for (const item of reply.items) {
+          const name = String(item?.name || "Produto")
+          const price = item?.price != null ? item.price : "-"
+          const imageUrl = item?.image ? String(item.image) : ""
+          const caption = catalogImageCaption(name, price)
+
+          if (imageUrl) {
+            await sendWhatsappImage(imageUrl, caption, {
+              catalog: true,
+              catalogItem: {
+                name,
+                price,
+                image: imageUrl,
+                link: item?.link,
+              },
+            })
+          } else {
+            await sessions[sessionCompanyId]?.sendMessage(msgData.key.remoteJid, { text: caption })
+            await saveMessageToDb(phone, "out", caption, "ai", sessionCompanyId, null, null)
+          }
+        }
+        return
+      }
+
+      // Afiliado VTEX (MENZ): texto introdutório + uma imagem por produto (caption = nome/preço/link).
+      const affiliateImages = Array.isArray(res.data?.images) ? res.data.images : []
+      const affiliateCaptions = Array.isArray(res.data?.captions) ? res.data.captions : []
+      const affiliatePreface =
+        typeof res.data?.preface === "string" ? res.data.preface.trim() : ""
+      if (affiliateImages.length > 0) {
+        if (affiliatePreface) {
+          await sessions[sessionCompanyId]?.sendMessage(msgData.key.remoteJid, {
+            text: affiliatePreface,
+          })
+          await saveMessageToDb(phone, "out", affiliatePreface, "ai", sessionCompanyId, null, null)
+        } else if (reply) {
+          const fallbackIntro = String(reply).trim()
+          if (fallbackIntro) {
+            await sessions[sessionCompanyId]?.sendMessage(msgData.key.remoteJid, { text: fallbackIntro })
+            await saveMessageToDb(phone, "out", fallbackIntro, "ai", sessionCompanyId, null, null)
+          }
+        }
+        for (let i = 0; i < affiliateImages.length; i++) {
+          const imageUrl = String(affiliateImages[i] || "").trim()
+          if (!imageUrl) continue
+          const caption = String(affiliateCaptions[i] || "").trim()
+          await sendWhatsappImage(imageUrl, caption, {
+            affiliate: true,
+            source: "vtex",
+            brand: /mizuno/i.test(caption) ? "mizuno" : "olympikus",
+          })
+        }
+        return
+      }
+
+
+
+      //
+      // 🔊 AUDIO RESPONSE SUPPORT (Tuexpo Voice TTS)
+      //
+
+      if (res?.data?.response_type === "audio" && res?.data?.response_audio_path) {
+
+        try {
+
+          const buffer = fs.readFileSync(res.data.response_audio_path)
+
+          await sessions[sessionCompanyId]?.sendMessage(
+            msgData.key.remoteJid,
+            {
+              audio: buffer,
+              mimetype: "audio/ogg; codecs=opus",
+              ptt: true
+            }
+          )
+
+          console.log("🎙️ Audio reply sent successfully")
+
+          return
+
+        } catch (err) {
+
+          console.log("❌ Audio send failed:", err)
+
+        }
+
+      }
+
+      console.log("→ Enviando respuesta a WhatsApp:", reply)
+
+      await sessions[sessionCompanyId]?.sendMessage(
+        msgData.key.remoteJid,
+        { text: String(reply || "") }
+      )
+
+      await saveMessageToDb(
+        phone,
+        "out",
+        String(reply || ""),
+        "ai",
+        sessionCompanyId,
+        null,
+        null
+      )
+
+    } catch (e) {
+
+      console.error("❌ Error calling Flask:", e.response?.data || e.message)
+
+    }
+  })
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", tenants: statusStore })
+})
+
+app.get("/qr", (req, res) => {
+  const companyId = tenantFromRequest(req)
+  const updatedAt = qrUpdatedAtStore[companyId] || Date.now()
+  const ageSec = Math.floor((Date.now() - updatedAt) / 1000)
+  const expiresIn = Math.max(0, 120 - ageSec)
+  const sock = sessions[companyId]
+  // Prefer explicit connection state; sock.user may persist briefly after disconnect.
+  const computedStatus = statusStore[companyId] || (sock && sock.user ? "connected" : "unknown")
+  res.json({
+    company_id: companyId,
+    status: computedStatus,
+    qr: qrStore[companyId] || null,
+    qr_updated_at: new Date(updatedAt).toISOString(),
+    qr_expires_in_seconds: expiresIn,
+  })
+})
+
+app.post("/connect", async (req, res) => {
+  const companyId = tenantFromRequest(req)
+  try {
+    if (connectInProgress[companyId]) {
+      return res.status(429).json({ error: "connect_in_progress" })
+    }
+    connectInProgress[companyId] = true
+
+    qrStore[companyId] = null
+    statusStore[companyId] = "waiting_qr"
+    qrUpdatedAtStore[companyId] = Date.now()
+
+    await startWhatsApp(companyId, true)
+    res.json({ company_id: companyId, status: "waiting_qr" })
+  } catch (e) {
+    console.error("connect failed:", e.message || e)
+    res.status(500).json({ error: "connect_failed", detail: e.message || e })
+  } finally {
+    connectInProgress[companyId] = false
+  }
+})
+
+app.post("/send", async (req, res) => {
+
+  const { number, message } = req.body
+  const companyId = tenantFromRequest(req)
+  let sock = sessions[companyId]
+
+  // Lazy bootstrap: after a restart we only start tenant 1 by default.
+  // If a tenant tries to send while its socket isn't started, start it automatically
+  // (without forcing a new QR).
+  if (!sock) {
+    try {
+      await startWhatsApp(companyId, false)
+      sock = sessions[companyId]
+    } catch (e) {
+      return res.status(503).json({
+        error: "whatsapp_not_connected",
+        company_id: companyId,
+        status: statusStore[companyId] || "unknown",
+        detail: String(e?.message || e || "start_failed"),
+      })
+    }
+  }
+
+  if (!sock || !sock.user) {
+    return res.status(503).json({
+      error: "whatsapp_not_connected",
+      company_id: companyId,
+      status: statusStore[companyId] || "unknown",
+    })
+  }
+
+  const digits = String(number || "").replace(/\D/g, "")
+  if (!digits) {
+    return res.status(400).json({ error: "invalid_number" })
+  }
+
+  // Mexico nuance: some accounts may still be reachable only via 521XXXXXXXXXX.
+  // Try candidates and send to the first one that works.
+  const candidates = [digits]
+  if (digits.startsWith("52") && digits.length === 12) {
+    const last10 = digits.slice(2)
+    candidates.unshift("521" + last10)
+  } else if (digits.startsWith("521") && digits.length === 13) {
+    candidates.unshift("52" + digits.slice(3))
+  }
+
+  let lastErr = null
+  for (const cand of candidates) {
+    const jid = cand + "@s.whatsapp.net"
+    try {
+      await sock.sendMessage(jid, { text: String(message || "") })
+      // Persist as canonical digits (52 + 10) so Inbox doesn't fork threads.
+      const canonicalPhone = normalizeMxDigits(cand)
+      await saveMessageToDb(canonicalPhone, "out", String(message || ""), "web", companyId, null, null)
+      return res.json({ sent: true, jid, normalized_number: cand })
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  return res.status(502).json({
+    error: "send_failed",
+    detail: String(lastErr?.message || lastErr || "unknown"),
+    tried: candidates,
+  })
+})
+
+app.listen(3010, async () => {
+
+  console.log("Tuexpo WhatsApp connector iniciado en puerto 3010")
+
+  await startWhatsApp(1, false)
+  await startWhatsApp(2, false)
+
+})
