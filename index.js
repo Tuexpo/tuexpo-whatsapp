@@ -7,6 +7,7 @@ const axios = require("axios")
 const fs = require("fs")
 const path = require("path")
 const mysql = require("mysql2/promise")
+const { resetPeerSession } = require("./resetPeerSession")
 
 let makeWASocket
 let useMultiFileAuthState
@@ -39,7 +40,8 @@ function cacheNormalizeJid(jid) {
 }
 
 const app = express()
-const JSON_BODY_LIMIT = process.env.WHATSAPP_JSON_LIMIT || "50mb"
+/** Inbound JSON (p. ej. media_base64); mínimo 25mb para audio WhatsApp sin cortes silenciosos. */
+const JSON_BODY_LIMIT = process.env.WHATSAPP_JSON_LIMIT || "25mb"
 app.use(express.json({ limit: JSON_BODY_LIMIT }))
 
 /** Debe coincidir con Gunicorn (p. ej. tuexpo.service -b 127.0.0.1:5000). Antes estaba 5001 y Flask nunca recibía el webhook. */
@@ -51,6 +53,29 @@ const BAILEYS_MESSAGE_UPDATE_WEBHOOK_URL =
   "http://127.0.0.1:5000/webhook/baileys/message-update"
 const BAILEYS_WEBHOOK_SECRET = String(process.env.BAILEYS_WEBHOOK_SECRET || "").trim()
 const DISABLE_AUTO_REPLY = String(process.env.DISABLE_AUTO_REPLY || "").trim() === "1"
+
+function panelBaseUrlFromIncoming() {
+  const incoming = String(TUEXPO_WHATSAPP_INCOMING_URL || "").trim()
+  return incoming.replace(/\/whatsapp\/incoming\/?$/i, "")
+}
+
+/** Fusiona en MySQL mensajes/estado guardados bajo LID hacia MSISDN (panel /whatsapp/lid-merge). */
+async function postLidMergeToPanel(tenantId, lidDigits, msisdnDigits) {
+  const base = panelBaseUrlFromIncoming()
+  if (!base) return
+  const lid = String(lidDigits || "").replace(/\D/g, "")
+  const msisdn = normalizeMxDigits(String(msisdnDigits || "").replace(/\D/g, ""))
+  if (!lid || !msisdn || lid === msisdn || lid.length < 11) return
+  const url = `${base.replace(/\/$/, "")}/whatsapp/lid-merge`
+  const headers = { "Content-Type": "application/json" }
+  if (BAILEYS_WEBHOOK_SECRET) headers["X-Baileys-Secret"] = BAILEYS_WEBHOOK_SECRET
+  try {
+    const res = await axios.post(url, { tenant_id: tenantId, lid, msisdn }, { headers, timeout: 8000 })
+    console.log("[LID_MERGE] panel", res.data?.merged || res.data)
+  } catch (e) {
+    console.warn("[LID_MERGE] panel failed", e?.response?.data || e?.message || e)
+  }
+}
 
 function parseTenantList(raw, fallback = [2]) {
   const src = String(raw || "").trim()
@@ -126,6 +151,20 @@ const inboundSeen = new Map()
 const INBOUND_SEEN_TTL_MS = 10 * 60 * 1000
 const catalogMessageIdsByTenant = {} // { [companyId]: stanzaId[] }
 const lidMapping = new Map()
+
+/** WA WebMessageInfo.StubType: mensaje no descifrable / sesión peer corrupta. */
+const STUB_CIPHERTEXT = 2
+const STUB_PAYMENT_CIPHERTEXT = 47
+
+/** message-receipt.update: muchos eventos para el mismo mensaje (bucle retry / ack raro). */
+const receiptBurstByKey = new Map()
+const RECEIPT_BURST_WINDOW_MS = 22_000
+const RECEIPT_BURST_THRESHOLD = 14
+
+/** connection.update close: varios cierres seguidos (WhatsApp o sesión inestable). */
+const closeTimestampsByTenant = new Map()
+const CLOSE_STORM_WINDOW_MS = 120_000
+const CLOSE_STORM_THRESHOLD = 4
 
 /** Baileys usa esto en reintentos / ack con phash; sin caché el 2º mensaje puede quedar "esperando descargar". */
 const sentMessageCacheByTenant = {} // { [tenantId]: Map<string, IMessage> }
@@ -339,17 +378,28 @@ function isUsableLatamRelayJid(jid) {
   return d.length >= 12 && d.length <= 14
 }
 
-/** Prefer WhatsApp's chat JID when panel passes it (relay / LID session). */
 function outboundJidFromRequestBody(body) {
   const raw = String(body?.remoteJid || body?.remote_jid || "").trim()
+
   if (!raw) return ""
-  if (raw.includes("@g.us") || raw.includes("newsletter")) return ""
-  if (raw.includes(":")) return ""
-  if (!raw.includes("@")) return ""
-  if (!isUsableLatamRelayJid(raw)) {
-    console.warn("[OUTBOUND] Ignorando JID relay no-MSISDN del panel:", raw.slice(0, 56))
-    return ""
+
+  // IMPORTANT:
+  // Preserve same-thread addressing if the Inbox provides a LID JID.
+  // This prevents breaking the Signal ratchet when replying after inbound messages.
+  if (raw.endsWith("@lid")) {
+    console.log("[OUTBOUND SAME-THREAD LID FROM PANEL]", raw)
+    return raw
   }
+
+  // Block unsupported chat types
+  if (raw.includes("@g.us") || raw.includes("newsletter")) return ""
+
+  // Ignore device-scoped relay JIDs
+  if (raw.includes(":")) return ""
+
+  if (!raw.includes("@")) return ""
+
+  // Allow normal MSISDN JIDs
   return raw
 }
 
@@ -409,18 +459,220 @@ function isOutboundTransientTimeout(e) {
   return /timed?\s*out/i.test(String(e?.message || e || ""))
 }
 
+function normalizeOutboundJid(jid, fallbackPhone) {
+  const raw = String(jid || "").trim()
+  if (!raw) return null
+
+  if (raw.endsWith("@lid")) {
+    return raw
+  }
+
+  if (raw === "status@broadcast") {
+    return null
+  }
+
+  const numeric = raw.replace("@s.whatsapp.net", "")
+  if (/^\d{16,}$/.test(numeric)) {
+    const fb = String(fallbackPhone || "").replace(/\D/g, "")
+    if (!fb) return null
+    return `${fb}@s.whatsapp.net`
+  }
+
+  return raw
+}
+
+/**
+ * Inbox / panel must not send quotedMessage or contextInfo to Baileys — breaks Signal ratchet / ghost threads.
+ * Strips reply linkage from any outbound content object before sock.sendMessage.
+ */
+function stripQuotedContextFromOutboundSendContent(content) {
+  if (!content || typeof content !== "object" || Buffer.isBuffer(content)) return content
+  const out = { ...content }
+  delete out.contextInfo
+  delete out.quotedMessage
+  delete out.quoted
+  delete out.quotedMessageId
+  for (const key of Object.keys(out)) {
+    const v = out[key]
+    if (!v || typeof v !== "object" || Buffer.isBuffer(v)) continue
+    if (key === "text" && typeof v === "string") continue
+    const inner = { ...v }
+    delete inner.contextInfo
+    delete inner.quotedMessage
+    delete inner.quotedMessageId
+    out[key] = inner
+  }
+  return out
+}
+
+/** Coerce Inbox/panel `message` to plain string (never forward proto / quoted JSON as body). */
+function plainTextForConnectorSend(message) {
+  if (message == null) return ""
+  if (typeof message === "string") {
+    const t = message.trim()
+    if (t.startsWith("{") && t.endsWith("}")) {
+      try {
+        return plainTextForConnectorSend(JSON.parse(t))
+      } catch (_) {
+        return message
+      }
+    }
+    return message
+  }
+  if (typeof message === "object") {
+    if (typeof message.text === "string") return message.text
+    const et = message.extendedTextMessage
+    if (et && typeof et.text === "string") return et.text
+    if (typeof message.conversation === "string") return message.conversation
+  }
+  return String(message)
+}
+
+function isDecryptPeerSendError(err) {
+  const m = String(err?.message || err || "")
+  return (
+    m.includes("Closing session") ||
+    m.includes("Bad MAC") ||
+    m.includes("No session") ||
+    m.includes("Cannot decrypt") ||
+    m.includes("failed to decrypt") ||
+    m.includes("decrypt message") ||
+    m.includes("Signal error")
+  )
+}
+
+async function resetPeerSignalSession(jid, tenantId) {
+  try {
+    const tid = parseInt(String(tenantId), 10)
+    if (!Number.isFinite(tid) || tid <= 0) return
+    const number = String(jid || "").split("@")[0].replace(/\D/g, "")
+    if (!number) return
+
+    const base = path.resolve("/opt/tuexpo-whatsapp/sessions", String(tid))
+    if (!base.startsWith("/opt/tuexpo-whatsapp/sessions/")) return
+    if (!fs.existsSync(base)) return
+
+    const files = fs.readdirSync(base)
+    files.forEach((file) => {
+      const name = String(file || "")
+      if (!name.includes(number)) return
+      if (!(name.startsWith("session-") || name.startsWith("sender-key-"))) return
+      const full = path.resolve(base, name)
+      if (!full.startsWith(base + path.sep)) return
+      fs.unlinkSync(full)
+      console.log("[SESSION RESET FILE REMOVED]", name)
+    })
+  } catch (err) {
+    console.log("[SESSION RESET FAILED]", err?.message || err)
+  }
+}
+
+function recoverPeerSignalSession(sock, tenantId, jid, reason) {
+  const j = String(jid || "").trim()
+  const tid = parseInt(String(tenantId), 10)
+  if (!sock || !j) return
+  console.log("[SELF-HEAL] signal session reset", tenantId, jid, reason)
+  console.warn("⚠️ Resetting peer signal session:", j, reason ? `(${reason})` : "")
+  if (Number.isFinite(tid) && tid > 0) {
+    try {
+      resetPeerSession(path.join(__dirname, "sessions", String(tid)), j)
+    } catch (e) {
+      console.warn("[recoverPeerSignalSession] resetPeerSession", e?.message || e)
+    }
+  }
+  try {
+    sock.ev.emit("creds.update", {})
+  } catch (_) {}
+}
+
+function trackReceiptBurst(tenantId, remoteJid, msgId) {
+  const mid = String(msgId || "").trim()
+  const rj = String(remoteJid || "").trim()
+  if (!mid || !rj) return false
+  const key = `${tenantId}:${rj}:${mid}`
+  const now = Date.now()
+  let slot = receiptBurstByKey.get(key)
+  if (!slot || now - slot.t0 > RECEIPT_BURST_WINDOW_MS) {
+    slot = { n: 0, t0: now }
+  }
+  slot.n += 1
+  receiptBurstByKey.set(key, slot)
+  if (receiptBurstByKey.size > 8000) {
+    for (const [kk, s] of receiptBurstByKey.entries()) {
+      if (now - s.t0 > RECEIPT_BURST_WINDOW_MS * 2) receiptBurstByKey.delete(kk)
+    }
+  }
+  return slot.n >= RECEIPT_BURST_THRESHOLD
+}
+
+function clearReceiptBurst(tenantId, remoteJid, msgId) {
+  const key = `${tenantId}:${String(remoteJid || "").trim()}:${String(msgId || "").trim()}`
+  receiptBurstByKey.delete(key)
+}
+
 /**
  * Reintentos con backoff (env BAILEYS_SEND_408_RETRIES, por defecto 4).
+ * Ante errores de sesión signal (Bad MAC / decrypt) limpia peer + emite creds.update y reintenta una vez.
  * @param {Record<string, unknown>} [opts] opciones Baileys para sendMessage (tercer argumento)
  */
-async function sendMessageReliable(sock, jid, content, opts = {}) {
+async function sendMessageReliable(sock, jid, content, opts = {}, fallbackPhone = "") {
   const n = Math.max(1, parseInt(process.env.BAILEYS_SEND_408_RETRIES || "4", 10) || 4)
   let last = null
+  const tenantId = sock?.__connectorTenantId
+  const jidOriginal = String(jid || "").trim()
+
+  async function doSend() {
+    let normalizedJid = normalizeOutboundJid(jidOriginal, fallbackPhone)
+    if (normalizedJid && normalizedJid.endsWith("@s.whatsapp.net")) {
+      const digits = String(normalizedJid).replace("@s.whatsapp.net", "").replace(/\D/g, "")
+      if (digits.length > 15) {
+        const fb = String(fallbackPhone || "").replace(/\D/g, "")
+        normalizedJid = fb ? `${fb}@s.whatsapp.net` : null
+      }
+    }
+    console.log("[OUTBOUND ROUTING]", {
+      original: jidOriginal,
+      normalized: normalizedJid,
+      fallbackPhone: String(fallbackPhone || "").replace(/\D/g, ""),
+      tenantId: tenantId,
+    })
+    if (!normalizedJid) {
+      console.log("[BLOCKED INVALID OUTBOUND TARGET]", {
+        original: jidOriginal,
+        fallbackPhone: String(fallbackPhone || "").replace(/\D/g, ""),
+        tenantId: tenantId,
+      })
+      return null
+    }
+    const safeContent = stripQuotedContextFromOutboundSendContent(content)
+    return await sock.sendMessage(normalizedJid, safeContent, opts)
+  }
+
   for (let i = 0; i < n; i++) {
     try {
-      return await sock.sendMessage(jid, content, opts)
+      const sent = await doSend()
+      if (!sent) return null
+      return sent
     } catch (e) {
       last = e
+      if (isDecryptPeerSendError(e)) {
+        const normForReset = normalizeOutboundJid(jidOriginal, fallbackPhone) || jidOriginal
+        console.log("[SESSION DRIFT DETECTED]", normForReset)
+        await resetPeerSignalSession(normForReset, tenantId)
+        console.warn("[sendMessageReliable] decrypt/session error → recover + retry once", {
+          jid: String(normForReset).slice(0, 72),
+          detail: String(e?.message || e).slice(0, 160),
+        })
+        recoverPeerSignalSession(sock, tenantId, normForReset, "sendMessageReliable")
+        await new Promise((r) => setTimeout(r, 280))
+        try {
+          const sent2 = await doSend()
+          if (!sent2) return null
+          return sent2
+        } catch (e2) {
+          throw e2
+        }
+      }
       if (i < n - 1 && isOutboundTransientTimeout(e)) {
         const delay = Math.min(12000, 2000 * (i + 1))
         console.warn("[sendMessageReliable] timeout/408, reintento", {
@@ -445,7 +697,7 @@ async function sendMessageWithMxFallback(sockInstance, targetJid, content, sendO
   const send =
     typeof sendOne === "function"
       ? sendOne
-      : (j, c) => sendMessageReliable(sockInstance, j, c)
+      : (j, c) => sendMessageReliable(sockInstance, j, c, {}, String(j || "").replace(/\D/g, ""))
   const baseJid = String(targetJid || "").trim()
   if (!baseJid) throw new Error("missing jid")
   if (!baseJid.endsWith("@s.whatsapp.net")) {
@@ -500,24 +752,12 @@ async function sendToPreferredOrMsisdnVariants(
           return sent
         }
       : async (j, c) => {
-          const sent = await sendMessageReliable(sockInstance, j, c)
+          const sent = await sendMessageReliable(sockInstance, j, c, {}, d)
           if (tenantIdForMessageCache) rememberSentProtoMessage(tenantIdForMessageCache, sent)
           return sent
         }
 
-  const prefIsLid =
-    pref.includes("@lid") ||
-    (pref.endsWith("@s.whatsapp.net") && String(pref.split("@")[0]).length > 13)
-  /** Forzar MSISDN antes que @lid (cualquier país). */
-  const lidMsisdnFirstEnv = String(process.env.BAILEYS_LID_MSISDN_FIRST || "").trim() === "1"
-  /**
-   * Brasil (55…): por defecto MSISDN antes que @lid — muchos casos la esposa/dispositivo no “ven” el saliente solo-LID.
-   * México (52…): por defecto @lid primero para no abrir segundo hilo 521 vs LID (BAILEYS_LID_MSISDN_FIRST=1 revierte).
-   */
-  const brMsisdnBeforeLid =
-    String(process.env.BAILEYS_BR_MSISDN_FIRST ?? "1").trim() !== "0" && d.startsWith("55") && d.length >= 12
-
-  const msisdnFirstForLidChat = prefIsLid && !!d && (lidMsisdnFirstEnv || brMsisdnBeforeLid)
+  const prefIsLidOnly = pref.includes("@lid")
 
   const tryMsisdnVariants = () =>
     sendMessageWithMxFallback(
@@ -528,36 +768,20 @@ async function sendToPreferredOrMsisdnVariants(
       tenantIdForMessageCache
     )
 
-  if (prefIsLid && d) {
-    return tryMsisdnVariants()
+  /**
+   * Inbox same-thread: panel pasa @lid. Enviar solo a ese JID (Signal ratchet LID↔PN).
+   * Nunca fallback a @s.whatsapp.net aquí (rompe sesión / mensajes fantasma).
+   */
+  if (prefIsLidOnly) {
+    try {
+      const sent = await send(pref, content)
+      console.log("[OUTBOUND ok @lid same-thread]", String(pref).slice(0, 56))
+      return sent
+    } catch (e) {
+      console.warn("[OUTBOUND @lid same-thread falló, no fallback PN]", String(pref).slice(0, 40), e?.message || e)
+      throw e
+    }
   }
-
-
-    const tryMsisdn = async () => {
-      try {
-        const sent = await tryMsisdnVariants()
-        console.log("[OUTBOUND ok MSISDN (hilo LID)", { d, afterLid: !msisdnFirstForLidChat })
-        return sent
-      } catch (e) {
-        lastErr = e
-        console.warn("[OUTBOUND MSISDN falló (hilo LID)", d, e?.message || e)
-        return null
-      }
-    }
-
-    if (msisdnFirstForLidChat) {
-      let s = await tryMsisdn()
-      if (s) return s
-      s = await tryLidRelay()
-      if (s) return s
-    } else {
-      let s = await tryLidRelay()
-      if (s) return s
-      s = await tryMsisdn()
-      if (s) return s
-    }
-    throw lastErr || new Error("outbound LID+MSISDN failed")
-
 
   if (pref && !pref.includes("@lid")) {
     try {
@@ -775,6 +999,29 @@ async function persistIncomingMedia(sockInstance, msgData, tenantId) {
         { logger: dlLogger, reuploadRequest: reupload }
       )
     } catch (e1) {
+      if (isDecryptPeerSendError(e1) && sockInstance && msgData?.key?.remoteJid) {
+        console.warn("[WATCHDOG] downloadMediaMessage decrypt → recover peer", msgData.key.remoteJid)
+        recoverPeerSignalSession(
+          sockInstance,
+          tenantId,
+          String(msgData.key.remoteJid),
+          "downloadMediaMessage"
+        )
+        await new Promise((r) => setTimeout(r, 280))
+        try {
+          buffer = await downloadMediaMessage(
+            msgData,
+            "buffer",
+            {},
+            { logger: dlLogger, reuploadRequest: reupload }
+          )
+        } catch (e1b) {
+          console.warn("downloadMediaMessage failed after recover:", e1b?.message || e1b)
+        }
+      }
+      if (buffer) {
+        /* recovered */
+      } else {
       // Algunos mensajes solo traen directPath (sin url); downloadMediaMessage falla antes de descargar.
       console.warn("downloadMediaMessage failed, fallback directPath:", e1?.message || e1)
       const { downloadContentFromMessage } = await import("@whiskeysockets/baileys/lib/Utils/messages-media.js")
@@ -796,6 +1043,7 @@ async function persistIncomingMedia(sockInstance, msgData, tenantId) {
                       : "image"
       const stream = await downloadContentFromMessage(content, dlKind, {})
       buffer = await streamToBuffer(stream)
+      }
     }
 
     await fs.promises.writeFile(absPath, buffer)
@@ -936,24 +1184,43 @@ async function startWhatsApp(companyId, forceNew = false) {
   const sock = makeWASocket({
     version,
     auth: state,
+    getMessage: async (_key) => {
+      return {
+        conversation: "",
+      }
+    },
     logger: P({ level: "silent" }),
     browser: ["Tuexpo Voice", "Chrome", "1.0.0"],
     defaultQueryTimeoutMs: parseInt(process.env.BAILEYS_QUERY_TIMEOUT_MS || "240000", 10) || 240000,
     retryRequestDelayMs: parseInt(process.env.BAILEYS_RETRY_REQUEST_DELAY_MS || "400", 10) || 400,
     markOnlineOnConnect: String(process.env.BAILEYS_MARK_ONLINE || "").trim() === "1",
-    getMessage: async (key) => {
-      try {
-        return await getMessageFromTenantCache(tenantId, key)
-      } catch (e) {
-        console.warn("[getMessage]", e?.message || e)
-        return undefined
-      }
-    },
   })
 
   sessions[tenantId] = sock
+  sock.__connectorTenantId = tenantId
   statusStore[tenantId] = statusStore[tenantId] || "connecting"
   sock.ev.on("creds.update", saveCreds)
+
+  /** WhatsApp comparte LID ↔ PN; persiste para resolveCanonicalChatJid tras reinicio. */
+  sock.ev.on("chats.phoneNumberShare", (evt) => {
+    try {
+      const lid = String(evt?.lid || "").trim()
+      const jid = String(evt?.jid || "").trim()
+      if (!lid.endsWith("@lid") || !jid.endsWith("@s.whatsapp.net") || jid.includes(":")) return
+      lidMapping.set(lid, jid)
+      const lidPlain = lid.replace(/@lid$/i, "").trim()
+      if (lidPlain) {
+        const phoneDigits = jid.replace("@s.whatsapp.net", "").replace(/\D/g, "")
+        const reversePath = path.join(sessionDir, `lid-mapping-${lidPlain}_reverse.json`)
+        fs.writeFileSync(reversePath, JSON.stringify(phoneDigits), "utf8")
+        console.log("[LID↔PN] chats.phoneNumberShare", { lid, jid: jid.slice(0, 28) + "…" })
+        const lidDigitsOnly = lid.replace(/@lid$/i, "").replace(/\D/g, "")
+        void postLidMergeToPanel(tenantId, lidDigitsOnly, phoneDigits)
+      }
+    } catch (e) {
+      console.warn("[LID↔PN] handler", e?.message || e)
+    }
+  })
 
   sock.ev.on("connection.update", (update) => {
     if (socketGeneration[tenantId] !== gen) return
@@ -987,6 +1254,32 @@ async function startWhatsApp(companyId, forceNew = false) {
 
       console.log(`Conexión cerrada (tenant ${tenantId})`)
       statusStore[tenantId] = "disconnected"
+
+      const boomMsg = String(
+        lastDisconnect?.error?.message ||
+          lastDisconnect?.error?.output?.payload?.message ||
+          lastDisconnect?.error?.data ||
+          ""
+      )
+      const cryptoClose = /Bad MAC|Cannot decrypt|No session|failed to decrypt|decrypt message|Signal error/i.test(
+        boomMsg
+      )
+      const nowClose = Date.now()
+      const prevCloses = (closeTimestampsByTenant.get(tenantId) || []).filter((t) => nowClose - t < CLOSE_STORM_WINDOW_MS)
+      prevCloses.push(nowClose)
+      closeTimestampsByTenant.set(tenantId, prevCloses)
+      const closeStorm = prevCloses.length >= CLOSE_STORM_THRESHOLD
+      if ((cryptoClose || closeStorm) && sock?.ev) {
+        console.warn("[WATCHDOG] connection close storm / crypto → creds.update", {
+          tenantId,
+          cryptoClose,
+          closeStorm,
+          boomMsg: boomMsg.slice(0, 140),
+        })
+        try {
+          sock.ev.emit("creds.update", {})
+        } catch (_) {}
+      }
 
       if (shouldReconnect && BAILEYS_AUTO_RECONNECT) {
         if (reconnectTimers[tenantId]) clearTimeout(reconnectTimers[tenantId])
@@ -1068,6 +1361,19 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
       const status = upd?.receipt?.type || "unknown"
 
+      const burst = trackReceiptBurst(tenantId, remoteJid, msgId)
+      const retryish = burst || String(status || "").toLowerCase() === "retry"
+      if (retryish && sessions[tenantId]) {
+        console.warn("[WATCHDOG] retry receipt loop → reset peer + creds", {
+          tenantId,
+          remoteJid: String(remoteJid).slice(0, 56),
+          msgId,
+          status,
+        })
+        recoverPeerSignalSession(sessions[tenantId], tenantId, remoteJid, "message-receipt.update")
+        clearReceiptBurst(tenantId, remoteJid, msgId)
+      }
+
       const headers = {}
       if (BAILEYS_WEBHOOK_SECRET) headers["X-Baileys-Secret"] = BAILEYS_WEBHOOK_SECRET
 
@@ -1106,6 +1412,24 @@ sock.ev.on("message-receipt.update", async (updates) => {
     if (!msgData) return
     if (socketGeneration[tenantId] !== gen) return
 
+    const stubType = msgData.messageStubType
+    if (stubType === STUB_CIPHERTEXT) {
+      const rjStub = String(msgData?.key?.remoteJid || "").trim()
+      if (rjStub && !rjStub.endsWith("@g.us") && rjStub !== "status@broadcast" && !rjStub.includes("newsletter")) {
+        console.log("[WATCHDOG] ciphertext stub detected (ignored temporarily)", {
+          tenantId,
+          stubType,
+          rj: rjStub.slice(0, 56),
+        })
+      }
+    } else if (stubType === STUB_PAYMENT_CIPHERTEXT) {
+      const rjStub = String(msgData?.key?.remoteJid || "").trim()
+      if (rjStub && !rjStub.endsWith("@g.us") && rjStub !== "status@broadcast" && !rjStub.includes("newsletter")) {
+        console.warn("[WATCHDOG] messageStubType ciphertext → reset peer", { tenantId, stubType, rj: rjStub.slice(0, 56) })
+        recoverPeerSignalSession(sock, tenantId, rjStub, "messageStubType")
+      }
+    }
+
     try {
       const runtimeRemoteJid = String(msgData?.key?.remoteJid || "").trim()
       const runtimeParticipant = String(msgData?.key?.participant || "").trim()
@@ -1123,25 +1447,29 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
     const m = msgData.message || {}
 
-    // DETECTAR RESPUESTA CITADA A PRODUCTO
+    // DETECTAR RESPUESTA CITADA (swipe / reply) — stanzaId para inventario automotive + Menz.
     const quotedId =
       m?.extendedTextMessage?.contextInfo?.stanzaId ||
       m?.imageMessage?.contextInfo?.stanzaId ||
       m?.videoMessage?.contextInfo?.stanzaId ||
       m?.documentMessage?.contextInfo?.stanzaId ||
+      m?.buttonsResponseMessage?.contextInfo?.stanzaId ||
+      m?.listResponseMessage?.contextInfo?.stanzaId ||
+      m?.templateButtonReplyMessage?.contextInfo?.stanzaId ||
       null
 
     if (quotedId) {
-      console.log("[MENZ QUOTED PRODUCT DETECTED]", quotedId)
+      console.log(`[tenant:${tenantId}] QUOTED PRODUCT DETECTED`, quotedId)
     }
 
     const remoteJid = msgData.key.remoteJid || ""
     const msgKeyId = String(msgData?.key?.id || "").trim()
-    if (markInboundSeen(tenantId, msgKeyId, remoteJid)) {
-      console.log("↷ duplicate upsert ignored", { tenantId, remoteJid, msgKeyId })
+    const fromMe = !!msgData.key.fromMe
+    // Solo deduplicar salientes / reintentos fromMe; inbound real nunca se descarta por id repetido.
+    if (fromMe && markInboundSeen(tenantId, msgKeyId, remoteJid)) {
+      console.log("↷ duplicate upsert ignored (fromMe)", { tenantId, remoteJid, msgKeyId })
       return
     }
-    const fromMe = !!msgData.key.fromMe
     const participant = msgData.key.participant || ""
     // permitir que mensajes enviados desde operador también se envíen al backend
     // (evitamos loops en Flask, no aquí)
@@ -1238,34 +1566,65 @@ sock.ev.on("message-receipt.update", async (updates) => {
       }
     }
 
-    if (!resolvedPhone && remoteJid?.endsWith("@lid")) {
-      resolvedPhone = remoteJid
-      console.log("[PHONE RESOLVER FALLBACK LID]", remoteJid)
+    // Baileys 6.5 decodeMessageNode: chat …@lid y MSISDN en key.senderPn / participantPn (attrs sender_pn).
+    // Baileys 7+: a veces remoteJidAlt / participantAlt.
+    const rjLidCheck = String(remoteJid || "").trim()
+    if (msgData?.key) {
+      const tryPnMsisdn = (jid) => {
+        const s = String(jid || "").trim()
+        if (!s) return ""
+        if (!s.includes("@")) {
+          const d0 = normalizeMxDigits(s.replace(/\D/g, ""))
+          if (
+            /^\d{10,15}$/.test(d0) &&
+            !/^(1\d{14}|[2678]\d{10,14})$/.test(d0) &&
+            d0.startsWith("5")
+          ) {
+            return d0
+          }
+          return ""
+        }
+        if (!s.endsWith("@s.whatsapp.net") || s.includes(":")) return ""
+        const digits = normalizeMxDigits(s.replace("@s.whatsapp.net", "").replace(/\D/g, ""))
+        if (
+          /^\d{10,15}$/.test(digits) &&
+          !/^(1\d{14}|[2678]\d{10,14})$/.test(digits) &&
+          digits.startsWith("5")
+        ) {
+          return digits
+        }
+        return ""
+      }
+      const k = msgData.key
+      const altDigits =
+        tryPnMsisdn(k.remoteJidAlt) ||
+        tryPnMsisdn(k.participantAlt) ||
+        tryPnMsisdn(k.senderPn) ||
+        tryPnMsisdn(k.participantPn) ||
+        ""
+      if (altDigits) {
+        resolvedPhone = altDigits
+        console.log("[PHONE RESOLVER senderPn/Alt]", {
+          remoteJid: rjLidCheck,
+          resolvedPhone: altDigits,
+          hadSenderPn: !!k.senderPn,
+          hadParticipantPn: !!k.participantPn,
+        })
+      }
     }
 
     if (!resolvedPhone) {
       console.log("[PHONE DROPPED INVALID]", canonicalRemoteJid)
     }
 
-    if (resolvedPhone && resolvedPhone.length > 18) {
-      console.log("[IGNORED INVALID LONG ID]", resolvedPhone)
+    const _resolvedDigits = String(resolvedPhone || "").replace(/\D/g, "")
+    if (resolvedPhone && _resolvedDigits.length > 25) {
+      console.log("[IGNORED INVALID LONG ID]", remoteJid)
       resolvedPhone = null
     }
 
     phone = resolvedPhone
     const sender = resolvedPhone
-
-    const rawText =
-      msgData.message?.conversation ||
-      msgData.message?.extendedTextMessage?.text ||
-      msgData.message?.imageMessage?.caption ||
-      msgData.message?.videoMessage?.caption ||
-      ""
-
-    if (!rawText) {
-      console.log("[MESSAGE DROPPED EMPTY PAYLOAD]")
-      return
-    }
 
     const hasMedia = !!(
       m.imageMessage ||
@@ -1277,7 +1636,22 @@ sock.ev.on("message-receipt.update", async (updates) => {
       m.ptvMessage
     )
 
-    const message = String(rawText || "")
+    const rawText =
+      msgData.message?.conversation ||
+      msgData.message?.extendedTextMessage?.text ||
+      msgData.message?.ephemeralMessage?.message?.conversation ||
+      msgData.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+      msgData.message?.viewOnceMessage?.message?.conversation ||
+      msgData.message?.viewOnceMessage?.message?.extendedTextMessage?.text ||
+      msgData.message?.imageMessage?.caption ||
+      msgData.message?.videoMessage?.caption ||
+      ""
+
+    const message = String(rawText || "").trim() || (hasMedia ? "[media]" : "")
+    if (!message && !hasMedia) {
+      console.log("[MESSAGE DROPPED EMPTY PAYLOAD]")
+      return
+    }
 
 
     const textNorm = String(message).trim().toLowerCase()
@@ -1362,10 +1736,15 @@ sock.ev.on("message-receipt.update", async (updates) => {
     let persist = { mediaType: null, mediaUrl: null, mimeType: null, ptt: null, mediaBase64: null }
     if (!fromMe && phone && textForBrain) {
       persist = await persistIncomingMedia(sock, msgData, sessionCompanyId)
-      await saveMessageToDb(phone, "in", textForBrain, "client", sessionCompanyId, persist.mediaType, persist.mediaUrl)
+      false && await saveMessageToDb(phone, "in", textForBrain, "client", sessionCompanyId, persist.mediaType, persist.mediaUrl)
     }
 
     try {
+      if (sender && String(sender).endsWith("@lid")) {
+        console.log("[SKIP RELAY ENVELOPE DUPLICATE EVENT]", sender)
+        return
+      }
+
       const webhookPhone = normalizeMxDigits(String(phone || sender || "").replace(/\D/g, ""))
       console.log("→ Enviando a Flask...", TUEXPO_WHATSAPP_INCOMING_URL)
       const logPayload = {
@@ -1388,18 +1767,33 @@ sock.ev.on("message-receipt.update", async (updates) => {
         return normalizeMxDigits(p.replace("@s.whatsapp.net", "").replace(/\D/g, ""))
       })()
       const phoneForWebhook = String(resolvedPhone || participantMsisdn || webhookPhone || "").trim()
+      const k = msgData.key || {}
       const flaskBody = {
         phone: phoneForWebhook,
         sender: phoneForWebhook || resolvedPhone || remoteJid,
         remoteJid: webhookChatJid,
-        rawRemoteJid: remoteJid,
-        key: { remoteJid: webhookChatJid },
+        rawRemoteJid: String(k.remoteJid || remoteJid || "").trim(),
+        remoteJidAlt: k.remoteJidAlt,
+        participantAlt: k.participantAlt,
+        senderPn: k.senderPn,
+        participantPn: k.participantPn,
+        key: {
+          id: k.id,
+          remoteJid: k.remoteJid,
+          remoteJidAlt: k.remoteJidAlt,
+          participant: k.participant,
+          participantAlt: k.participantAlt,
+          senderPn: k.senderPn,
+          participantPn: k.participantPn,
+          fromMe: !!k.fromMe,
+        },
         tenant_id: sessionCompanyId,
         company_id: sessionCompanyId,
         participant,
         fromMe,
         text: textForBrain,
         message: textForBrain,
+        // Swipe / reply: panel + automotive_brain (resolve_product_from_stanza + catalog_stanza_ids).
         quoted_id: quotedId,
         catalog_stanza_ids: catalogMessageIdsByTenant[sessionCompanyId] || [],
       }
@@ -1446,15 +1840,23 @@ sock.ev.on("message-receipt.update", async (updates) => {
       }
 
       const canonical_phone = canonicalPhoneFromFlask
-      let targetJid = null
+      if (!canonical_phone) {
+        console.log("[BLOCKED OUTBOUND: missing canonical_phone]", {
+          remoteJid,
+          participant
+        })
+        return
+      }
 
-      if (remoteJid?.endsWith("@lid")) {
-        targetJid = remoteJid
-      } else if (sender) {
-        targetJid = sender
+      const inboundChatJid = String(remoteJid || "").trim()
+      let targetJid = null
+      if (inboundChatJid.endsWith("@lid")) {
+        console.log("[OUTBOUND USING PEER LID]", inboundChatJid)
+        targetJid = inboundChatJid
       } else {
         targetJid = `${canonical_phone}@s.whatsapp.net`
       }
+
       console.log("Outbound targetJid resolved:", {
         tenant: sessionCompanyId,
         targetJid,
@@ -1536,6 +1938,19 @@ sock.ev.on("message-receipt.update", async (updates) => {
             image_url: imageUrl,
             link: it?.link ? String(it.link) : undefined,
           })
+        } else if (opts && opts.automotive_vehicle && typeof opts.automotive_vehicle === "object") {
+          const av = opts.automotive_vehicle
+          Object.assign(metaObj, {
+            automotive_inventory: true,
+            source: "bndv_inventory",
+            title: av.title ? String(av.title) : undefined,
+            brand: av.brand ? String(av.brand) : undefined,
+            model: av.model ? String(av.model) : undefined,
+            year_model: av.year_model ? String(av.year_model) : undefined,
+            price_brl: av.price_brl != null && av.price_brl !== "" ? String(av.price_brl) : undefined,
+            image_url: imageUrl,
+            persisted_at: new Date().toISOString(),
+          })
         }
         const metaJson =
           Object.keys(metaObj).length > 0 ? JSON.stringify(metaObj) : null
@@ -1556,7 +1971,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
           const pre = String(reply.preface).trim()
           if (pre) {
             await sendMessageWithMxFallback(replySock, targetJid, { text: pre }, null, sessionCompanyId)
-            await saveMessageToDb(phone, "out", pre, "ai", sessionCompanyId, null, null)
+            false && await saveMessageToDb(phone, "out", pre, "ai", sessionCompanyId, null, null)
           }
         }
         for (const item of reply.items) {
@@ -1577,7 +1992,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
             })
           } else {
             await sendMessageWithMxFallback(replySock, targetJid, { text: caption }, null, sessionCompanyId)
-            await saveMessageToDb(phone, "out", caption, "ai", sessionCompanyId, null, null)
+            false && await saveMessageToDb(phone, "out", caption, "ai", sessionCompanyId, null, null)
           }
         }
         return
@@ -1599,12 +2014,12 @@ sock.ev.on("message-receipt.update", async (updates) => {
             null,
             sessionCompanyId
           )
-          await saveMessageToDb(phone, "out", affiliatePreface, "ai", sessionCompanyId, null, null)
+          false && await saveMessageToDb(phone, "out", affiliatePreface, "ai", sessionCompanyId, null, null)
         } else if (reply) {
           const fallbackIntro = String(reply).trim()
           if (fallbackIntro) {
             await sendMessageWithMxFallback(replySock, targetJid, { text: fallbackIntro }, null, sessionCompanyId)
-            await saveMessageToDb(phone, "out", fallbackIntro, "ai", sessionCompanyId, null, null)
+            false && await saveMessageToDb(phone, "out", fallbackIntro, "ai", sessionCompanyId, null, null)
           }
         }
         for (let i = 0; i < affiliateImages.length; i++) {
@@ -1668,6 +2083,29 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
           console.log("🎙️ Audio reply sent successfully")
 
+          const imgsAfterAudio = Array.isArray(res?.data?.response_images) ? res.data.response_images : []
+          for (const item of imgsAfterAudio) {
+            const imageUrl = String(item?.image_url ?? "").trim()
+            if (!imageUrl) continue
+            try {
+              const cap = String(item?.caption ?? "").trim()
+              await sendWhatsappImage(imageUrl, cap, {
+                automotive_vehicle: {
+                  title: String(item?.title || "").trim() || cap.split("—")[0]?.trim() || "",
+                  brand: String(item?.brand || "").trim(),
+                  model: String(item?.model || "").trim(),
+                  year_model: String(item?.year_model || "").trim(),
+                  price_brl: item?.price != null ? String(item.price) : "",
+                },
+              })
+            } catch (imgErr) {
+              console.log("❌ Inventory image after audio failed:", imgErr)
+            }
+          }
+          if (imgsAfterAudio.length) {
+            console.log("🚗 Inventory image(s) sent after audio")
+          }
+
           return
 
         } catch (err) {
@@ -1676,6 +2114,44 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
         }
 
+      }
+
+      // 🚗 Inventario: hasta 3 fotos (por response_images, no por response_type: con TTS sigue siendo "audio" + imágenes)
+      if (Array.isArray(res?.data?.response_images) && res.data.response_images.length) {
+        let sentSomething = false
+        const intro = String(reply || "").trim()
+        if (intro) {
+          try {
+            await sendMessageWithMxFallback(replySock, targetJid, { text: intro }, null, sessionCompanyId)
+            false && await saveMessageToDb(phone, "out", intro, "ai", sessionCompanyId, null, null)
+            sentSomething = true
+          } catch (txtErr) {
+            console.log("❌ Inventory intro text failed:", txtErr)
+          }
+        }
+        for (const item of res.data.response_images) {
+          const imageUrl = String(item?.image_url ?? "").trim()
+          if (!imageUrl) continue
+          try {
+            const cap = String(item?.caption ?? "").trim()
+            await sendWhatsappImage(imageUrl, cap, {
+              automotive_vehicle: {
+                title: String(item?.title || "").trim() || cap.split("—")[0]?.trim() || "",
+                brand: String(item?.brand || "").trim(),
+                model: String(item?.model || "").trim(),
+                year_model: String(item?.year_model || "").trim(),
+                price_brl: item?.price != null ? String(item.price) : "",
+              },
+            })
+            sentSomething = true
+          } catch (imgErr) {
+            console.log("❌ Inventory multi_image item failed:", imgErr)
+          }
+        }
+        if (sentSomething) {
+          console.log("🚗 Inventory multi_image reply sent")
+          return
+        }
       }
 
       console.log("→ Enviando respuesta a WhatsApp:", reply)
@@ -1775,6 +2251,7 @@ app.post("/connect", async (req, res) => {
 app.post("/send", async (req, res) => {
 
   const { number, message } = req.body
+  const plainSendText = plainTextForConnectorSend(message)
   const mediaBase64Legacy = String(req.body?.media_base64 || req.body?.base64 || "").trim()
   const companyId = tenantFromRequest(req)
   if (!isTenantEnabled(companyId)) {
@@ -1810,7 +2287,7 @@ app.post("/send", async (req, res) => {
   // Backward compatibility: old panel versions post media to /send.
   if (mediaBase64Legacy) {
     const mimetype = String(req.body?.mime_type || req.body?.mimetype || "application/octet-stream").trim()
-    const caption = String(req.body?.caption || req.body?.message || "").trim()
+    const caption = String(req.body?.caption || plainSendText || "").trim()
     const filename = String(req.body?.filename || "attachment").trim() || "attachment"
     let buffer = null
     try {
@@ -1883,7 +2360,7 @@ app.post("/send", async (req, res) => {
     for (const cand of candidatesMedia) {
       const jid = cand + "@s.whatsapp.net"
       try {
-        const sent = await sendMessageReliable(sock, jid, content)
+        const sent = await sendMessageReliable(sock, jid, content, {}, phone)
         rememberSentProtoMessage(companyId, sent)
         const canonicalPhone = normalizeMxDigits(cand)
         const mediaUrl = await persistOutboundMediaBuffer(buffer, mimetype, companyId, "send")
@@ -1933,7 +2410,7 @@ app.post("/send", async (req, res) => {
 
   // NEW: remote image_url support (affiliate catalogs)
   const imageUrl = req.body?.image_url || null
-  const caption = String(req.body?.caption || message || "").trim()
+  const caption = String(req.body?.caption || plainSendText || "").trim()
 
   if (imageUrl) {
     const jid = digits + "@s.whatsapp.net"
@@ -1941,7 +2418,7 @@ app.post("/send", async (req, res) => {
       const sent = await sendMessageReliable(sock, jid, {
         image: { url: imageUrl },
         caption: caption || undefined,
-      })
+      }, {}, digits)
       rememberSentProtoMessage(companyId, sent)
 
       const canonicalPhone = normalizeMxDigits(digits)
@@ -1982,13 +2459,15 @@ app.post("/send", async (req, res) => {
       const sent = await sendToPreferredOrMsisdnVariants(
         sock,
         preferredJid,
-        { text: String(message || "") },
+        { text: plainSendText },
         null,
         digits,
         companyId
       )
       console.log("[OUTBOUND USING remoteJid]", preferredJid)
-      await saveMessageToDb(persistPhone, "out", String(message || ""), "web", companyId, null, null)
+      if (req.body.source !== "ai") {
+        await saveMessageToDb(persistPhone, "out", plainSendText, "web", companyId, null, null)
+      }
       return res.json({
         sent: true,
         jid: preferredJid,
@@ -1997,6 +2476,13 @@ app.post("/send", async (req, res) => {
         key: sent?.key || null,
       })
     } catch (ePref) {
+      if (String(preferredJid || "").endsWith("@lid")) {
+        console.warn("[OUTBOUND @lid same-thread error, no MSISDN fallback]", ePref?.message || ePref)
+        return res.status(502).json({
+          error: "send_failed",
+          detail: String(ePref?.message || ePref || "lid_send_failed"),
+        })
+      }
       console.warn("[OUTBOUND remoteJid failed, falling back to MSISDN]", ePref?.message || ePref)
     }
   }
@@ -2005,10 +2491,12 @@ app.post("/send", async (req, res) => {
   for (const cand of candidates) {
     const jid = cand + "@s.whatsapp.net"
     try {
-      const sent = await sendMessageWithMxFallback(sock, jid, { text: String(message || "") }, null, companyId)
+      const sent = await sendMessageWithMxFallback(sock, jid, { text: plainSendText }, null, companyId)
       // Persist as canonical digits (52 + 10) so Inbox doesn't fork threads.
       const canonicalPhone = normalizeMxDigits(cand)
-      await saveMessageToDb(canonicalPhone, "out", String(message || ""), "web", companyId, null, null)
+      if (req.body.source !== "ai") {
+        await saveMessageToDb(canonicalPhone, "out", plainSendText, "web", companyId, null, null)
+      }
       return res.json({
         sent: true,
         jid,
@@ -2104,7 +2592,7 @@ app.post("/sendMedia", async (req, res) => {
   const trySendMediaToJid = async (jid) => {
     let sent = null
     try {
-      sent = await sendMessageReliable(sock, jid, content)
+      sent = await sendMessageReliable(sock, jid, content, {}, digits)
     } catch (eSend) {
       if (mediaType === "audio" && mm.includes("webm")) {
         const fallbackDoc = {
@@ -2113,7 +2601,7 @@ app.post("/sendMedia", async (req, res) => {
           fileName: filename || "voice.webm",
           caption: caption || undefined,
         }
-        sent = await sendMessageReliable(sock, jid, fallbackDoc)
+        sent = await sendMessageReliable(sock, jid, fallbackDoc, {}, digits)
       } else {
         throw eSend
       }
