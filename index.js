@@ -88,6 +88,19 @@ function parseTenantList(raw, fallback = [2]) {
   return out.length ? out : [...fallback]
 }
 
+function discoverTenantsFromSessions(baseDir = "/opt/tuexpo-whatsapp/sessions") {
+  try {
+    return fs
+      .readdirSync(baseDir)
+      .filter((name) => /^\d+$/.test(String(name || "")))
+      .map((name) => parseInt(String(name), 10))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .sort((a, b) => a - b)
+  } catch (_) {
+    return []
+  }
+}
+
 /**
  * Lista blanca opcional. Si no defines CONNECTOR_TENANTS o pones "*", cualquier tenant con sesión puede usar /send y sockets.
  * Para restringir: CONNECTOR_TENANTS=2,4
@@ -101,8 +114,11 @@ const CONNECTOR_TENANTS = CONNECTOR_ALLOW_ALL ? null : parseTenantList(_connecto
  */
 const CONNECTOR_AUTO_START = String(process.env.CONNECTOR_AUTO_START ?? "0").trim() === "1"
 /** Si CONNECTOR_AUTO_START=1: al arrancar, levantar estas sesiones. */
+const DISCOVERED_SESSION_TENANTS = discoverTenantsFromSessions("/opt/tuexpo-whatsapp/sessions")
 const CONNECTOR_BOOTSTRAP_TENANTS = CONNECTOR_ALLOW_ALL
-  ? parseTenantList(process.env.CONNECTOR_BOOTSTRAP_TENANTS || "1,2,3,4,5", [1, 2, 3, 4, 5])
+  ? (String(process.env.CONNECTOR_BOOTSTRAP_TENANTS || "").trim()
+      ? parseTenantList(process.env.CONNECTOR_BOOTSTRAP_TENANTS || "", DISCOVERED_SESSION_TENANTS)
+      : DISCOVERED_SESSION_TENANTS)
   : CONNECTOR_TENANTS
 
 const ENABLE_AUTO_REPLY_TENANTS = parseTenantList(process.env.ENABLE_AUTO_REPLY_TENANTS || "2,4", [2, 4])
