@@ -1,12 +1,4 @@
 require('dotenv').config()
-function tlog(tenantId, ...args) {
-  if (tenantId) {
-    console.log(`[tenant ${tenantId}]`, ...args)
-  } else {
-    console.log(...args)
-  }
-}
-
 const express = require("express")
 const P = require("pino")
 const qrcode = require("qrcode-terminal")
@@ -79,7 +71,7 @@ async function postLidMergeToPanel(tenantId, lidDigits, msisdnDigits) {
   if (BAILEYS_WEBHOOK_SECRET) headers["X-Baileys-Secret"] = BAILEYS_WEBHOOK_SECRET
   try {
     const res = await axios.post(url, { tenant_id: tenantId, lid, msisdn }, { headers, timeout: 8000 })
-    tlog(tenantId, "[LID_MERGE] panel", res.data?.merged || res.data)
+    console.log("[LID_MERGE] panel", res.data?.merged || res.data)
   } catch (e) {
     console.warn("[LID_MERGE] panel failed", e?.response?.data || e?.message || e)
   }
@@ -584,10 +576,10 @@ async function resetPeerSignalSession(jid, tenantId) {
       const full = path.resolve(base, name)
       if (!full.startsWith(base + path.sep)) return
       fs.unlinkSync(full)
-      tlog(tenantId, "[SESSION RESET FILE REMOVED]", name)
+      console.log("[SESSION RESET FILE REMOVED]", name)
     })
   } catch (err) {
-    tlog(tenantId, "[SESSION RESET FAILED]", err?.message || err)
+    console.log("[SESSION RESET FAILED]", err?.message || err)
   }
 }
 
@@ -595,7 +587,7 @@ function recoverPeerSignalSession(sock, tenantId, jid, reason) {
   const j = String(jid || "").trim()
   const tid = parseInt(String(tenantId), 10)
   if (!sock || !j) return
-  tlog(tenantId, "[SELF-HEAL] signal session reset", jid, reason)
+  console.log("[SELF-HEAL] signal session reset", tenantId, jid, reason)
   console.warn("⚠️ Resetting peer signal session:", j, reason ? `(${reason})` : "")
   if (Number.isFinite(tid) && tid > 0) {
     try {
@@ -654,14 +646,14 @@ async function sendMessageReliable(sock, jid, content, opts = {}, fallbackPhone 
         normalizedJid = fb ? `${fb}@s.whatsapp.net` : null
       }
     }
-    tlog(tenantId, "[OUTBOUND ROUTING]", {
+    console.log("[OUTBOUND ROUTING]", {
       original: jidOriginal,
       normalized: normalizedJid,
       fallbackPhone: String(fallbackPhone || "").replace(/\D/g, ""),
       tenantId: tenantId,
     })
     if (!normalizedJid) {
-      tlog(tenantId, "[BLOCKED INVALID OUTBOUND TARGET]", {
+      console.log("[BLOCKED INVALID OUTBOUND TARGET]", {
         original: jidOriginal,
         fallbackPhone: String(fallbackPhone || "").replace(/\D/g, ""),
         tenantId: tenantId,
@@ -681,7 +673,7 @@ async function sendMessageReliable(sock, jid, content, opts = {}, fallbackPhone 
       last = e
       if (isDecryptPeerSendError(e)) {
         const normForReset = normalizeOutboundJid(jidOriginal, fallbackPhone) || jidOriginal
-        tlog(tenantId, "[SESSION DRIFT DETECTED]", normForReset)
+        console.log("[SESSION DRIFT DETECTED]", normForReset)
         await resetPeerSignalSession(normForReset, tenantId)
         console.warn("[sendMessageReliable] decrypt/session error → recover + retry once", {
           jid: String(normForReset).slice(0, 72),
@@ -744,7 +736,7 @@ async function sendMessageWithMxFallback(sockInstance, targetJid, content, sendO
     try {
       const sent = await send(jid, content)
       if (tenantIdForMessageCache) rememberSentProtoMessage(tenantIdForMessageCache, sent)
-      tlog(tenantIdForMessageCache, "Outbound delivered via candidate JID:", { requested: baseJid, used: jid })
+      console.log("Outbound delivered via candidate JID:", { requested: baseJid, used: jid })
       return sent
     } catch (e) {
       lastErr = e
@@ -776,19 +768,7 @@ async function sendToPreferredOrMsisdnVariants(
           return sent
         }
       : async (j, c) => {
-          let targetJid = j
-          const fallbackPhone = d
-
-          if (String(targetJid || "").endsWith("@lid") && fallbackPhone) {
-            const fb = String(fallbackPhone || "").replace(/\D/g, "")
-            if (fb) {
-              tlog(tenantIdForMessageCache, "[OUTBOUND FIX LEVEL 2] replacing @lid with MSISDN", fb)
-              targetJid = `${fb}@s.whatsapp.net`
-            }
-          }
-
-          tlog(tenantIdForMessageCache, "[OUTBOUND FINAL TARGET]", targetJid)
-          const sent = await sendMessageReliable(sockInstance, targetJid, c, {}, d)
+          const sent = await sendMessageReliable(sockInstance, j, c, {}, d)
           if (tenantIdForMessageCache) rememberSentProtoMessage(tenantIdForMessageCache, sent)
           return sent
         }
@@ -811,7 +791,7 @@ async function sendToPreferredOrMsisdnVariants(
   if (prefIsLidOnly) {
     try {
       const sent = await send(pref, content)
-      tlog(tenantIdForMessageCache, "[OUTBOUND ok @lid same-thread]", String(pref).slice(0, 56))
+      console.log("[OUTBOUND ok @lid same-thread]", String(pref).slice(0, 56))
       return sent
     } catch (e) {
       console.warn("[OUTBOUND @lid same-thread falló, no fallback PN]", String(pref).slice(0, 40), e?.message || e)
@@ -822,7 +802,7 @@ async function sendToPreferredOrMsisdnVariants(
   if (pref && !pref.includes("@lid")) {
     try {
       const sent = await send(pref, content)
-      tlog(tenantIdForMessageCache, "[OUTBOUND ok via relay]", pref.length > 48 ? pref.slice(0, 48) + "…" : pref)
+      console.log("[OUTBOUND ok via relay]", pref.length > 48 ? pref.slice(0, 48) + "…" : pref)
       return sent
     } catch (eDirect) {
       console.warn("[OUTBOUND relay failed, number/variants]", eDirect?.message || eDirect)
@@ -1249,7 +1229,7 @@ async function startWhatsApp(companyId, forceNew = false) {
         const phoneDigits = jid.replace("@s.whatsapp.net", "").replace(/\D/g, "")
         const reversePath = path.join(sessionDir, `lid-mapping-${lidPlain}_reverse.json`)
         fs.writeFileSync(reversePath, JSON.stringify(phoneDigits), "utf8")
-        tlog(tenantId, "[LID↔PN] chats.phoneNumberShare", { lid, jid: jid.slice(0, 28) + "…" })
+        console.log("[LID↔PN] chats.phoneNumberShare", { lid, jid: jid.slice(0, 28) + "…" })
         const lidDigitsOnly = lid.replace(/@lid$/i, "").replace(/\D/g, "")
         void postLidMergeToPanel(tenantId, lidDigitsOnly, phoneDigits)
       }
@@ -1267,12 +1247,12 @@ async function startWhatsApp(companyId, forceNew = false) {
       qrStore[tenantId] = qr
       qrUpdatedAtStore[tenantId] = Date.now()
       statusStore[tenantId] = "waiting_qr"
-      tlog(tenantId, "\nESCANEA ESTE QR\n")
+      console.log("\nESCANEA ESTE QR\n")
       qrcode.generate(qr, { small: true })
     }
 
     if (connection === "open") {
-      tlog(tenantId, `WhatsApp conectado correctamente (tenant ${tenantId})`)
+      console.log(`WhatsApp conectado correctamente (tenant ${tenantId})`)
       statusStore[tenantId] = "connected"
       qrStore[tenantId] = null
       qrUpdatedAtStore[tenantId] = Date.now()
@@ -1288,7 +1268,7 @@ async function startWhatsApp(companyId, forceNew = false) {
       const shouldReconnect =
         lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
 
-      tlog(tenantId, `Conexión cerrada (tenant ${tenantId})`)
+      console.log(`Conexión cerrada (tenant ${tenantId})`)
       statusStore[tenantId] = "disconnected"
 
       const boomMsg = String(
@@ -1452,7 +1432,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
     if (stubType === STUB_CIPHERTEXT) {
       const rjStub = String(msgData?.key?.remoteJid || "").trim()
       if (rjStub && !rjStub.endsWith("@g.us") && rjStub !== "status@broadcast" && !rjStub.includes("newsletter")) {
-        tlog(tenantId, "[WATCHDOG] ciphertext stub detected (ignored temporarily)", {
+        console.log("[WATCHDOG] ciphertext stub detected (ignored temporarily)", {
           tenantId,
           stubType,
           rj: rjStub.slice(0, 56),
@@ -1495,7 +1475,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
       null
 
     if (quotedId) {
-      tlog(tenantId, `[tenant:${tenantId}] QUOTED PRODUCT DETECTED`, quotedId)
+      console.log(`[tenant:${tenantId}] QUOTED PRODUCT DETECTED`, quotedId)
     }
 
     const remoteJid = msgData.key.remoteJid || ""
@@ -1503,7 +1483,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
     const fromMe = !!msgData.key.fromMe
     // Solo deduplicar salientes / reintentos fromMe; inbound real nunca se descarta por id repetido.
     if (fromMe && markInboundSeen(tenantId, msgKeyId, remoteJid)) {
-      tlog(tenantId, "↷ duplicate upsert ignored (fromMe)", { tenantId, remoteJid, msgKeyId })
+      console.log("↷ duplicate upsert ignored (fromMe)", { tenantId, remoteJid, msgKeyId })
       return
     }
     const participant = msgData.key.participant || ""
@@ -1547,7 +1527,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         phone = digits
       }
     }
-    tlog(tenantId, "[PHONE RESOLVER]", {
+    console.log("[PHONE RESOLVER]", {
       participant: msgData?.key?.participant,
       remoteJid: msgData?.key?.remoteJid,
       resolvedPhone: phone
@@ -1562,11 +1542,11 @@ sock.ev.on("message-receipt.update", async (updates) => {
         const digits = rj.replace("@s.whatsapp.net", "").replace(/\D/g, "")
 
         if (digits.length >= 15) {
-          tlog(tenantId, "[LID DETECTED — IGNORING AS PHONE]", canonicalRemoteJid)
+          console.log("[LID DETECTED — IGNORING AS PHONE]", canonicalRemoteJid)
           resolvedPhone = null
           if (!resolvedPhone && canonicalRemoteJid?.endsWith("@s.whatsapp.net")) {
             resolvedPhone = canonicalRemoteJid.replace("@s.whatsapp.net", "").replace(/\D/g, "")
-            tlog(tenantId, "[PHONE RESOLVER LID FALLBACK ACTIVATED]", resolvedPhone)
+            console.log("[PHONE RESOLVER LID FALLBACK ACTIVATED]", resolvedPhone)
           }
         }
       }
@@ -1578,7 +1558,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
       if (p.endsWith("@s.whatsapp.net")) {
         resolvedPhone = p.replace("@s.whatsapp.net", "").replace(/\D/g, "")
 
-        tlog(tenantId, "[PHONE RESOLVER FALLBACK PARTICIPANT]", {
+        console.log("[PHONE RESOLVER FALLBACK PARTICIPANT]", {
           participant: p,
           resolvedPhone
         })
@@ -1594,7 +1574,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         if (digits.length < 15) {
           resolvedPhone = digits
 
-          tlog(tenantId, "[PHONE RESOLVER FALLBACK MSISDN]", {
+          console.log("[PHONE RESOLVER FALLBACK MSISDN]", {
             remoteJid: rj,
             resolvedPhone
           })
@@ -1640,7 +1620,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         ""
       if (altDigits) {
         resolvedPhone = altDigits
-        tlog(tenantId, "[PHONE RESOLVER senderPn/Alt]", {
+        console.log("[PHONE RESOLVER senderPn/Alt]", {
           remoteJid: rjLidCheck,
           resolvedPhone: altDigits,
           hadSenderPn: !!k.senderPn,
@@ -1667,7 +1647,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
           await db.end()
           if (rows && rows[0] && rows[0].phone) {
             resolvedPhone = rows[0].phone
-            tlog(tenantId, "[PHONE RESOLVED FROM jid_map]", { lidKey, resolvedPhone })
+            console.log("[PHONE RESOLVED FROM jid_map]", { lidKey, resolvedPhone })
           }
         }
       } catch (e) {
@@ -1676,12 +1656,12 @@ sock.ev.on("message-receipt.update", async (updates) => {
     }
 
     if (!resolvedPhone) {
-      tlog(tenantId, "[PHONE DROPPED INVALID]", canonicalRemoteJid)
+      console.log("[PHONE DROPPED INVALID]", canonicalRemoteJid)
     }
 
     const _resolvedDigits = String(resolvedPhone || "").replace(/\D/g, "")
     if (resolvedPhone && _resolvedDigits.length > 25) {
-      tlog(tenantId, "[IGNORED INVALID LONG ID]", remoteJid)
+      console.log("[IGNORED INVALID LONG ID]", remoteJid)
       resolvedPhone = null
     }
 
@@ -1710,19 +1690,8 @@ sock.ev.on("message-receipt.update", async (updates) => {
       ""
 
     const message = String(rawText || "").trim() || (hasMedia ? "[media]" : "")
-
-    // Filtrar eventos de infraestructura Signal (no son mensajes reales)
     if (!message && !hasMedia) {
-      const isInfraEvent = !!(
-        msgData.message?.protocolMessage ||
-        msgData.message?.senderKeyDistributionMessage ||
-        msgData.message?.historySyncNotification ||
-        msgData.messageStubType
-      )
-      if (isInfraEvent) {
-        return
-      }
-      tlog(tenantId, "[MESSAGE DROPPED EMPTY PAYLOAD]")
+      console.log("[MESSAGE DROPPED EMPTY PAYLOAD]")
       return
     }
 
@@ -1780,19 +1749,19 @@ sock.ev.on("message-receipt.update", async (updates) => {
       return
     }
 
-    tlog(tenantId, "CHAT DETECTADO:", remoteJid)
-    tlog(tenantId, "CHAT PARTICIPANT:", participant)
+    console.log("CHAT DETECTADO:", remoteJid)
+    console.log("CHAT PARTICIPANT:", participant)
     if (webhookChatJid !== chatSourceJid) {
-      tlog(tenantId, "CHAT NORMALIZED:", webhookChatJid, "src:", chatSourceJid)
+      console.log("CHAT NORMALIZED:", webhookChatJid, "src:", chatSourceJid)
     }
 
     // 🔥 BLOQUEO DEL GRUPO
     if (remoteJid?.includes("120363406188468587")) {
-      tlog(tenantId, "🚫 BLOQUEADO:", remoteJid)
+      console.log("🚫 BLOQUEADO:", remoteJid)
       return
     }
 
-    tlog(tenantId, "MENSAJE ENTRANTE:", textForBrain)
+    console.log("MENSAJE ENTRANTE:", textForBrain)
 
     const pushName = String(msgData.pushName || "").trim()
     if (!fromMe && phone && pushName) {
@@ -1814,12 +1783,12 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
     try {
       if (sender && String(sender).endsWith("@lid")) {
-        tlog(tenantId, "[SKIP RELAY ENVELOPE DUPLICATE EVENT]", sender)
+        console.log("[SKIP RELAY ENVELOPE DUPLICATE EVENT]", sender)
         return
       }
 
       const webhookPhone = normalizeMxDigits(String(phone || sender || "").replace(/\D/g, ""))
-      tlog(tenantId, "→ Enviando a Flask...", TUEXPO_WHATSAPP_INCOMING_URL)
+      console.log("→ Enviando a Flask...", TUEXPO_WHATSAPP_INCOMING_URL)
       const logPayload = {
         company_id: sessionCompanyId,
         tenant_id: sessionCompanyId,
@@ -1833,7 +1802,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         logPayload.ptt = persist.ptt
         logPayload.media_base64 = `<${persist.mediaBase64.length} chars>`
       }
-      tlog(tenantId, "WEBHOOK PAYLOAD:", logPayload)
+      console.log("WEBHOOK PAYLOAD:", logPayload)
       const participantMsisdn = (() => {
         const p = String(participant || "").trim()
         if (!p.endsWith("@s.whatsapp.net") || p.includes(":")) return ""
@@ -1879,7 +1848,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
       const res = await axios.post(TUEXPO_WHATSAPP_INCOMING_URL, flaskBody)
 
 
-      tlog(tenantId, "← Respuesta de Flask:", res.data)
+      console.log("← Respuesta de Flask:", res.data)
       const reply = res.data?.response
       const canonicalPhoneFromFlask = normalizeMxDigits(
         String(res.data?.canonical_phone || "").replace(/\D/g, "")
@@ -1902,7 +1871,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         "Automação ativada.",
       ])
       if (fromMe && isControlCommand && controlAcks.has(String(reply).trim())) {
-        tlog(tenantId, "↷ Control ACK suppressed from client chat")
+        console.log("↷ Control ACK suppressed from client chat")
         return
       }
 
@@ -1914,7 +1883,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
       const canonical_phone = canonicalPhoneFromFlask
       if (!canonical_phone) {
-        tlog(tenantId, "[BLOCKED OUTBOUND: missing canonical_phone]", {
+        console.log("[BLOCKED OUTBOUND: missing canonical_phone]", {
           remoteJid,
           participant
         })
@@ -1924,13 +1893,13 @@ sock.ev.on("message-receipt.update", async (updates) => {
       const inboundChatJid = String(remoteJid || "").trim()
       let targetJid = null
       if (inboundChatJid.endsWith("@lid")) {
-        tlog(tenantId, "[OUTBOUND USING PEER LID]", inboundChatJid)
+        console.log("[OUTBOUND USING PEER LID]", inboundChatJid)
         targetJid = inboundChatJid
       } else {
         targetJid = `${canonical_phone}@s.whatsapp.net`
       }
 
-      tlog(tenantId, "Outbound targetJid resolved:", {
+      console.log("Outbound targetJid resolved:", {
         tenant: sessionCompanyId,
         targetJid,
         sender,
@@ -2154,7 +2123,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
             })
           )
 
-          tlog(tenantId, "🎙️ Audio reply sent successfully")
+          console.log("🎙️ Audio reply sent successfully")
 
           const imgsAfterAudio = Array.isArray(res?.data?.response_images) ? res.data.response_images : []
           for (const item of imgsAfterAudio) {
@@ -2172,18 +2141,18 @@ sock.ev.on("message-receipt.update", async (updates) => {
                 },
               })
             } catch (imgErr) {
-              tlog(tenantId, "❌ Inventory image after audio failed:", imgErr)
+              console.log("❌ Inventory image after audio failed:", imgErr)
             }
           }
           if (imgsAfterAudio.length) {
-            tlog(tenantId, "🚗 Inventory image(s) sent after audio")
+            console.log("🚗 Inventory image(s) sent after audio")
           }
 
           return
 
         } catch (err) {
 
-          tlog(tenantId, "❌ Audio send failed:", err)
+          console.log("❌ Audio send failed:", err)
 
         }
 
@@ -2199,7 +2168,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
             false && await saveMessageToDb(phone, "out", intro, "ai", sessionCompanyId, null, null)
             sentSomething = true
           } catch (txtErr) {
-            tlog(tenantId, "❌ Inventory intro text failed:", txtErr)
+            console.log("❌ Inventory intro text failed:", txtErr)
           }
         }
         for (const item of res.data.response_images) {
@@ -2210,7 +2179,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
             const mediaType = String(item?.media_type ?? "image").trim()
             if (mediaType === "video") {
               await sendMessageWithMxFallback(replySock, targetJid, { video: { url: imageUrl }, caption: cap }, null, sessionCompanyId)
-              tlog(tenantId, "🎬 Education video sent:", imageUrl.slice(-40))
+              console.log("🎬 Education video sent:", imageUrl.slice(-40))
             } else {
               await sendWhatsappImage(imageUrl, cap, {
                 automotive_vehicle: {
@@ -2224,23 +2193,22 @@ sock.ev.on("message-receipt.update", async (updates) => {
             }
             sentSomething = true
           } catch (imgErr) {
-            tlog(tenantId, "❌ Inventory multi_image item failed:", imgErr)
+            console.log("❌ Inventory multi_image item failed:", imgErr)
           }
         }
         if (sentSomething) {
-          tlog(tenantId, "🚗 Inventory multi_image reply sent")
+          console.log("🚗 Inventory multi_image reply sent")
           return
         }
       }
 
-      tlog(tenantId, "→ Enviando respuesta a WhatsApp:", reply)
+      console.log("→ Enviando respuesta a WhatsApp:", reply)
 
-      await sendToPreferredOrMsisdnVariants(
+      await sendMessageWithMxFallback(
         replySock,
         targetJid,
         { text: String(reply || "") },
         null,
-        canonical_phone,
         sessionCompanyId
       )
 
@@ -2406,7 +2374,7 @@ app.post("/send", async (req, res) => {
           phone,
           companyId
         )
-        tlog(companyId, "[OUTBOUND USING remoteJid]", preferredMediaJid)
+        console.log("[OUTBOUND USING remoteJid]", preferredMediaJid)
         const canonicalPhone = normalizeMxDigits(phone)
         const mediaUrl = await persistOutboundMediaBuffer(buffer, mimetype, companyId, "send")
         await saveMessageToDb(
@@ -2544,7 +2512,7 @@ app.post("/send", async (req, res) => {
         digits,
         companyId
       )
-      tlog(companyId, "[OUTBOUND USING remoteJid]", preferredJid)
+      console.log("[OUTBOUND USING remoteJid]", preferredJid)
       if (req.body.source !== "ai") {
         await saveMessageToDb(persistPhone, "out", plainSendText, "web", companyId, null, null)
         req._msgSaved = true;
@@ -2702,7 +2670,7 @@ app.post("/sendMedia", async (req, res) => {
         digits,
         companyId
       )
-      tlog(companyId, "[OUTBOUND USING remoteJid]", preferredJidMedia)
+      console.log("[OUTBOUND USING remoteJid]", preferredJidMedia)
       const canonicalPhone = normalizeMxDigits(digits)
       const mediaUrl = await persistOutboundMediaBuffer(buffer, mimetype, companyId, "sendmedia")
       await saveMessageToDb(
