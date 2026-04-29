@@ -96,7 +96,7 @@ function parseTenantList(raw, fallback = [2]) {
   return out.length ? out : [...fallback]
 }
 
-function discoverTenantsFromSessions(baseDir = "/opt/tuexpo-whatsapp/sessions") {
+function discoverTenantsFromSessions(baseDir = path.join(__dirname, "sessions")) {
   try {
     return fs
       .readdirSync(baseDir)
@@ -122,7 +122,7 @@ const CONNECTOR_TENANTS = CONNECTOR_ALLOW_ALL ? null : parseTenantList(_connecto
  */
 const CONNECTOR_AUTO_START = String(process.env.CONNECTOR_AUTO_START ?? "0").trim() === "1"
 /** Si CONNECTOR_AUTO_START=1: al arrancar, levantar estas sesiones. */
-const DISCOVERED_SESSION_TENANTS = discoverTenantsFromSessions("/opt/tuexpo-whatsapp/sessions")
+const DISCOVERED_SESSION_TENANTS = discoverTenantsFromSessions(path.join(__dirname, "sessions"))
 const CONNECTOR_BOOTSTRAP_TENANTS = CONNECTOR_ALLOW_ALL
   ? (String(process.env.CONNECTOR_BOOTSTRAP_TENANTS || "").trim()
       ? parseTenantList(process.env.CONNECTOR_BOOTSTRAP_TENANTS || "", DISCOVERED_SESSION_TENANTS)
@@ -321,6 +321,74 @@ function normalizeMxDigits(phone) {
   return p
 }
 
+/** Dígitos del local de un JID @lid (ej. 1650…:2@lid → 1650…). Misma noción que Flask _digits_from_wa_remote_jid. */
+function waLocalDigitsFromLidJid(rj) {
+  const s = String(rj || "").trim()
+  if (!s.endsWith("@lid")) return ""
+  const base = s.split("@")[0].split(":")[0]
+  return String(base).replace(/\D/g, "")
+}
+
+function lidJidForLidToMsisdnMap(remoteJid, canonicalRemoteJid) {
+  const a = String(remoteJid || "").trim()
+  if (a.endsWith("@lid")) return a
+  const b = String(canonicalRemoteJid || "").trim()
+  if (b.endsWith("@lid")) return b
+  return ""
+}
+
+/**
+ * MSISDN desde senderPn / participantPn / *Alt. Alineado con @lid en chat: prioridad la define el caller.
+ * (México/Latam: normaliza 521→52, descarta ruido tipo 1650…@s.whatsapp.net.)
+ */
+function tryExtractLatamMsisdnFromPnField(jid) {
+  const s = String(jid || "").trim()
+  if (!s) return ""
+  if (!s.includes("@")) {
+    const d0 = normalizeMxDigits(s.replace(/\D/g, ""))
+    if (
+      /^\d{10,15}$/.test(d0) &&
+      !/^(1\d{14}|[2678]\d{10,14})$/.test(d0) &&
+      d0.startsWith("5")
+    ) {
+      return d0
+    }
+    return ""
+  }
+  if (!s.endsWith("@s.whatsapp.net") || s.includes(":")) return ""
+  const digits = normalizeMxDigits(s.replace("@s.whatsapp.net", "").replace(/\D/g, ""))
+  if (
+    /^\d{10,15}$/.test(digits) &&
+    !/^(1\d{14}|[2678]\d{10,14})$/.test(digits) &&
+    digits.startsWith("5")
+  ) {
+    return digits
+  }
+  return ""
+}
+
+async function persistJidMapLidToPhone(tenantId, lidJid, msisdnDigits) {
+  const lidJid0 = String(lidJid || "").trim()
+  const ph = String(msisdnDigits || "").replace(/\D/g, "")
+  if (!lidJid0.endsWith("@lid") || !/^\d{10,20}$/.test(ph)) return
+  try {
+    const db = await mysql.createConnection({
+      host: process.env.DB_HOST || "127.0.0.1",
+      user: process.env.DB_USER || "root",
+      password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+      database: process.env.DB_NAME || "tuexpo_voice"
+    })
+    await db.query(
+      "INSERT INTO jid_map (remote_jid, phone) VALUES (?, ?) ON DUPLICATE KEY UPDATE phone = VALUES(phone)",
+      [lidJid0, ph]
+    )
+    await db.end()
+  } catch (e) {
+    console.warn("[jid_map persist failed]", e?.message)
+  }
+  tlog(tenantId, "[jid_map PERSISTED]", { lid: lidJid0, phone: ph })
+}
+
 function resolveCanonicalChatJid(remoteJid, companyId) {
   const jid = String(remoteJid || "").trim()
   if (!jid) return jid
@@ -409,9 +477,8 @@ function outboundJidFromRequestBody(body) {
 
   // IMPORTANT:
   // Preserve same-thread addressing if the Inbox provides a LID JID.
-  // This prevents breaking the Signal ratchet when replying after inbound messages.
+  // Do NOT convert @lid to MSISDN here; canonical_phone is only fallback/storage.
   if (raw.endsWith("@lid")) {
-    console.log("[OUTBOUND SAME-THREAD LID FROM PANEL]", raw)
     return raw
   }
 
@@ -572,8 +639,8 @@ async function resetPeerSignalSession(jid, tenantId) {
     const number = String(jid || "").split("@")[0].replace(/\D/g, "")
     if (!number) return
 
-    const base = path.resolve("/opt/tuexpo-whatsapp/sessions", String(tid))
-    if (!base.startsWith("/opt/tuexpo-whatsapp/sessions/")) return
+    const base = path.resolve(path.join(__dirname, "sessions"), String(tid))
+    if (!base.startsWith(path.join(__dirname, "sessions") + "/")) return
     if (!fs.existsSync(base)) return
 
     const files = fs.readdirSync(base)
@@ -687,6 +754,9 @@ async function sendMessageReliable(sock, jid, content, opts = {}, fallbackPhone 
           jid: String(normForReset).slice(0, 72),
           detail: String(e?.message || e).slice(0, 160),
         })
+        if (!normForReset || normForReset.endsWith("@lid")) {
+          return
+        }
         recoverPeerSignalSession(sock, tenantId, normForReset, "sendMessageReliable")
         await new Promise((r) => setTimeout(r, 280))
         try {
@@ -767,6 +837,7 @@ async function sendToPreferredOrMsisdnVariants(
 ) {
   const pref = String(preferredJid || "").trim()
   const d = String(fallbackDigits || "").replace(/\D/g, "")
+  const canonicalPhone = d
 
   const send =
     typeof sendOne === "function"
@@ -776,24 +847,13 @@ async function sendToPreferredOrMsisdnVariants(
           return sent
         }
       : async (j, c) => {
-          let targetJid = j
-          const fallbackPhone = d
-
-          if (String(targetJid || "").endsWith("@lid") && fallbackPhone) {
-            const fb = String(fallbackPhone || "").replace(/\D/g, "")
-            if (fb) {
-              tlog(tenantIdForMessageCache, "[OUTBOUND FIX LEVEL 2] replacing @lid with MSISDN", fb)
-              targetJid = `${fb}@s.whatsapp.net`
-            }
-          }
+          const targetJid = j
 
           tlog(tenantIdForMessageCache, "[OUTBOUND FINAL TARGET]", targetJid)
           const sent = await sendMessageReliable(sockInstance, targetJid, c, {}, d)
           if (tenantIdForMessageCache) rememberSentProtoMessage(tenantIdForMessageCache, sent)
           return sent
         }
-
-  const prefIsLidOnly = pref.includes("@lid")
 
   const tryMsisdnVariants = () =>
     sendMessageWithMxFallback(
@@ -805,17 +865,21 @@ async function sendToPreferredOrMsisdnVariants(
     )
 
   /**
-   * Inbox same-thread: panel pasa @lid. Enviar solo a ese JID (Signal ratchet LID↔PN).
-   * Nunca fallback a @s.whatsapp.net aquí (rompe sesión / mensajes fantasma).
+   * Inbox same-thread: inbound @lid → transportar respuesta al mismo hilo (canonical MSISDN solo para DB/merge).
+   * Si falla el envío al @lid y hay MSISDN, probar variantes numéricas (MX/BR).
    */
-  if (prefIsLidOnly) {
+  if (pref.endsWith("@lid")) {
     try {
       const sent = await send(pref, content)
       tlog(tenantIdForMessageCache, "[OUTBOUND ok @lid same-thread]", String(pref).slice(0, 56))
       return sent
     } catch (e) {
-      console.warn("[OUTBOUND @lid same-thread falló, no fallback PN]", String(pref).slice(0, 40), e?.message || e)
-      throw e
+      if (!d) {
+        console.warn("[OUTBOUND @lid same-thread falló, no fallback PN]", String(pref).slice(0, 40), e?.message || e)
+        throw e
+      }
+      console.warn("[OUTBOUND @lid failed, MSISDN variants]", e?.message || e)
+      return tryMsisdnVariants()
     }
   }
 
@@ -1451,12 +1515,20 @@ sock.ev.on("message-receipt.update", async (updates) => {
     const stubType = msgData.messageStubType
     if (stubType === STUB_CIPHERTEXT) {
       const rjStub = String(msgData?.key?.remoteJid || "").trim()
-      if (rjStub && !rjStub.endsWith("@g.us") && rjStub !== "status@broadcast" && !rjStub.includes("newsletter")) {
-        tlog(tenantId, "[WATCHDOG] ciphertext stub detected (ignored temporarily)", {
+
+      if (
+        rjStub &&
+        !rjStub.endsWith("@g.us") &&
+        rjStub !== "status@broadcast" &&
+        !rjStub.includes("newsletter")
+      ) {
+        tlog(tenantId, "[WATCHDOG] ciphertext stub detected → repairing peer session", {
           tenantId,
           stubType,
           rj: rjStub.slice(0, 56),
         })
+
+        recoverPeerSignalSession(sock, tenantId, rjStub, "ciphertext_stub")
       }
     } else if (stubType === STUB_PAYMENT_CIPHERTEXT) {
       const rjStub = String(msgData?.key?.remoteJid || "").trim()
@@ -1531,8 +1603,52 @@ sock.ev.on("message-receipt.update", async (updates) => {
       msgData?.key?.remoteJid ||
       ""
     ).trim()
+    const rjLidCheck = String(remoteJid || "").trim()
+    // Prioridad 1) senderPn 2) participantPn 3) remoteJidAlt 4) participantAlt — antes que MSISDN desde JID (participant/remoteJid en key).
     let phone = null
+    if (msgData?.key) {
+      const k = msgData.key
+      const at =
+        (msgData.attrs && typeof msgData.attrs === "object" && msgData.attrs) || null
+      const senderPnRaw =
+        k.senderPn || msgData.senderPn || (at && (at.sender_pn || at.senderPn)) || ""
+      const participantPnRaw = k.participantPn || msgData.participantPn || ""
+      const remoteJidAltRaw = k.remoteJidAlt || msgData.remoteJidAlt || ""
+      const participantAltRaw = k.participantAlt || msgData.participantAlt || ""
+      const tryOrder = [
+        ["senderPn", senderPnRaw],
+        ["participantPn", participantPnRaw],
+        ["remoteJidAlt", remoteJidAltRaw],
+        ["participantAlt", participantAltRaw],
+      ]
+      let altDigits = ""
+      let pnSource = ""
+      for (const [name, raw] of tryOrder) {
+        const d = tryExtractLatamMsisdnFromPnField(raw)
+        if (d) {
+          altDigits = d
+          pnSource = name
+          break
+        }
+      }
+      if (altDigits) {
+        phone = altDigits
+        const lidJid0 = lidJidForLidToMsisdnMap(rjLidCheck, canonicalRemoteJid)
+        if (lidJid0) {
+          lidMapping.set(lidJid0, `${altDigits}@s.whatsapp.net`)
+          void persistJidMapLidToPhone(tenantId, lidJid0, altDigits)
+        }
+        tlog(tenantId, "[PHONE RESOLVER Pn/Alt]", {
+          remoteJid: rjLidCheck,
+          resolvedPhone: altDigits,
+          source: pnSource,
+          hadSenderPn: !!String(senderPnRaw || "").trim(),
+          hadParticipantPn: !!String(participantPnRaw || "").trim(),
+        })
+      }
+    }
     if (
+      !phone &&
       canonicalRemoteJid.endsWith("@s.whatsapp.net") &&
       !canonicalRemoteJid.includes(":")
     ) {
@@ -1602,53 +1718,6 @@ sock.ev.on("message-receipt.update", async (updates) => {
       }
     }
 
-    // Baileys 6.5 decodeMessageNode: chat …@lid y MSISDN en key.senderPn / participantPn (attrs sender_pn).
-    // Baileys 7+: a veces remoteJidAlt / participantAlt.
-    const rjLidCheck = String(remoteJid || "").trim()
-    if (msgData?.key) {
-      const tryPnMsisdn = (jid) => {
-        const s = String(jid || "").trim()
-        if (!s) return ""
-        if (!s.includes("@")) {
-          const d0 = normalizeMxDigits(s.replace(/\D/g, ""))
-          if (
-            /^\d{10,15}$/.test(d0) &&
-            !/^(1\d{14}|[2678]\d{10,14})$/.test(d0) &&
-            d0.startsWith("5")
-          ) {
-            return d0
-          }
-          return ""
-        }
-        if (!s.endsWith("@s.whatsapp.net") || s.includes(":")) return ""
-        const digits = normalizeMxDigits(s.replace("@s.whatsapp.net", "").replace(/\D/g, ""))
-        if (
-          /^\d{10,15}$/.test(digits) &&
-          !/^(1\d{14}|[2678]\d{10,14})$/.test(digits) &&
-          digits.startsWith("5")
-        ) {
-          return digits
-        }
-        return ""
-      }
-      const k = msgData.key
-      const altDigits =
-        tryPnMsisdn(k.remoteJidAlt) ||
-        tryPnMsisdn(k.participantAlt) ||
-        tryPnMsisdn(k.senderPn) ||
-        tryPnMsisdn(k.participantPn) ||
-        ""
-      if (altDigits) {
-        resolvedPhone = altDigits
-        tlog(tenantId, "[PHONE RESOLVER senderPn/Alt]", {
-          remoteJid: rjLidCheck,
-          resolvedPhone: altDigits,
-          hadSenderPn: !!k.senderPn,
-          hadParticipantPn: !!k.participantPn,
-        })
-      }
-    }
-
     if (!resolvedPhone) {
       // Last resort: consult jid_map in DB
       try {
@@ -1676,7 +1745,14 @@ sock.ev.on("message-receipt.update", async (updates) => {
     }
 
     if (!resolvedPhone) {
-      tlog(tenantId, "[PHONE DROPPED INVALID]", canonicalRemoteJid)
+      const forLid = String(remoteJid || canonicalRemoteJid || "").trim()
+      const localDigits = waLocalDigitsFromLidJid(forLid)
+      if (/^\d{10,20}$/.test(localDigits)) {
+        resolvedPhone = localDigits
+        tlog(tenantId, "[PHONE RESOLVER LID CANONICAL]", { remoteJid: forLid, resolvedPhone: localDigits })
+      } else {
+        tlog(tenantId, "[PHONE DROPPED INVALID]", canonicalRemoteJid)
+      }
     }
 
     const _resolvedDigits = String(resolvedPhone || "").replace(/\D/g, "")
@@ -1923,12 +1999,15 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
       const inboundChatJid = String(remoteJid || "").trim()
       let targetJid = null
+      // Mismo hilo que el inbound: si el chat llegó como @lid, transportar la respuesta al @lid (MSISDN sigue en DB).
       if (inboundChatJid.endsWith("@lid")) {
-        tlog(tenantId, "[OUTBOUND USING PEER LID]", inboundChatJid)
         targetJid = inboundChatJid
+        tlog(tenantId, "[OUTBOUND transport @lid same-thread]", inboundChatJid.slice(0, 56))
       } else {
         targetJid = `${canonical_phone}@s.whatsapp.net`
       }
+
+      const msisdnTransportJid = `${canonical_phone}@s.whatsapp.net`
 
       tlog(tenantId, "Outbound targetJid resolved:", {
         tenant: sessionCompanyId,
@@ -1937,6 +2016,36 @@ sock.ev.on("message-receipt.update", async (updates) => {
         remoteJid,
         participant,
       })
+
+      async function sendReplyTransport(content, sendOne = null) {
+        if (inboundChatJid.endsWith("@lid")) {
+          try {
+            return await sendMessageWithMxFallback(
+              replySock,
+              targetJid,
+              content,
+              sendOne,
+              sessionCompanyId
+            )
+          } catch (e) {
+            tlog(tenantId, "[OUTBOUND @lid send failed → MSISDN fallback]", e?.message || e)
+            return await sendMessageWithMxFallback(
+              replySock,
+              msisdnTransportJid,
+              content,
+              sendOne,
+              sessionCompanyId
+            )
+          }
+        }
+        return await sendMessageWithMxFallback(
+          replySock,
+          targetJid,
+          content,
+          sendOne,
+          sessionCompanyId
+        )
+      }
 
       function catalogImageCaption(name, priceRaw) {
         const nameStr = String(name || "Produto")
@@ -1953,16 +2062,10 @@ sock.ev.on("message-receipt.update", async (updates) => {
       }
 
       async function sendWhatsappImage(imageUrl, caption, opts = {}) {
-        const msg = await sendMessageWithMxFallback(
-          replySock,
-          targetJid,
-          {
-            image: { url: imageUrl },
-            caption: String(caption || ""),
-          },
-          null,
-          sessionCompanyId
-        )
+        const msg = await sendReplyTransport({
+          image: { url: imageUrl },
+          caption: String(caption || ""),
+        })
 
         const stanzaId =
           msg?.key?.id ||
@@ -2043,7 +2146,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         if (reply.preface) {
           const pre = String(reply.preface).trim()
           if (pre) {
-            await sendMessageWithMxFallback(replySock, targetJid, { text: pre }, null, sessionCompanyId)
+            await sendReplyTransport({ text: pre })
             false && await saveMessageToDb(phone, "out", pre, "ai", sessionCompanyId, null, null)
           }
         }
@@ -2064,7 +2167,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
               },
             })
           } else {
-            await sendMessageWithMxFallback(replySock, targetJid, { text: caption }, null, sessionCompanyId)
+            await sendReplyTransport({ text: caption })
             false && await saveMessageToDb(phone, "out", caption, "ai", sessionCompanyId, null, null)
           }
         }
@@ -2078,20 +2181,14 @@ sock.ev.on("message-receipt.update", async (updates) => {
         typeof res.data?.preface === "string" ? res.data.preface.trim() : ""
       if (affiliateImages.length > 0) {
         if (affiliatePreface) {
-          await sendMessageWithMxFallback(
-            replySock,
-            targetJid,
-            {
-              text: affiliatePreface,
-            },
-            null,
-            sessionCompanyId
-          )
+          await sendReplyTransport({
+            text: affiliatePreface,
+          })
           false && await saveMessageToDb(phone, "out", affiliatePreface, "ai", sessionCompanyId, null, null)
         } else if (reply) {
           const fallbackIntro = String(reply).trim()
           if (fallbackIntro) {
-            await sendMessageWithMxFallback(replySock, targetJid, { text: fallbackIntro }, null, sessionCompanyId)
+            await sendReplyTransport({ text: fallbackIntro })
             false && await saveMessageToDb(phone, "out", fallbackIntro, "ai", sessionCompanyId, null, null)
           }
         }
@@ -2120,17 +2217,11 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
           const buffer = fs.readFileSync(res.data.response_audio_path)
 
-          const sent = await sendMessageWithMxFallback(
-            replySock,
-            targetJid,
-            {
-              audio: buffer,
-              mimetype: "audio/ogg; codecs=opus",
-              ptt: true
-            },
-            null,
-            sessionCompanyId
-          )
+          const sent = await sendReplyTransport({
+            audio: buffer,
+            mimetype: "audio/ogg; codecs=opus",
+            ptt: true,
+          })
 
           const mediaUrl = await persistOutboundMediaBuffer(
             buffer,
@@ -2195,7 +2286,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         const intro = String(reply || "").trim()
         if (intro) {
           try {
-            await sendMessageWithMxFallback(replySock, targetJid, { text: intro }, null, sessionCompanyId)
+            await sendReplyTransport({ text: intro })
             false && await saveMessageToDb(phone, "out", intro, "ai", sessionCompanyId, null, null)
             sentSomething = true
           } catch (txtErr) {
@@ -2209,7 +2300,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
             const cap = String(item?.caption ?? "").trim()
             const mediaType = String(item?.media_type ?? "image").trim()
             if (mediaType === "video") {
-              await sendMessageWithMxFallback(replySock, targetJid, { video: { url: imageUrl }, caption: cap }, null, sessionCompanyId)
+              await sendReplyTransport({ video: { url: imageUrl }, caption: cap })
               tlog(tenantId, "🎬 Education video sent:", imageUrl.slice(-40))
             } else {
               await sendWhatsappImage(imageUrl, cap, {
@@ -2330,7 +2421,8 @@ app.post("/connect", async (req, res) => {
 
 app.post("/send", async (req, res) => {
 
-  const { number, message } = req.body
+  const number = req.body?.number || req.body?.phone || req.body?.to || req.body?.msisdn
+  const message = req.body?.message || req.body?.text || req.body?.body || ""
   const plainSendText = plainTextForConnectorSend(message)
   const mediaBase64Legacy = String(req.body?.media_base64 || req.body?.base64 || "").trim()
   const companyId = tenantFromRequest(req)
@@ -2396,8 +2488,12 @@ app.post("/send", async (req, res) => {
     }
     const candidatesMedia = buildWhatsAppPhoneCandidates(phone)
     const preferredMediaJid = outboundJidFromRequestBody(req.body)
-    if (preferredMediaJid) {
+    if (false && preferredMediaJid) {
       try {
+        const fallbackPhone = phone
+        if (preferredMediaJid?.endsWith("@lid") && fallbackPhone) {
+          preferredMediaJid = `${fallbackPhone}@s.whatsapp.net`
+        }
         const sent = await sendToPreferredOrMsisdnVariants(
           sock,
           preferredMediaJid,
@@ -2533,7 +2629,7 @@ app.post("/send", async (req, res) => {
   }
 
   const persistPhone = normalizeMxDigits(digits)
-  const preferredJid = outboundJidFromRequestBody(req.body)
+  let preferredJid = outboundJidFromRequestBody(req.body)
   if (preferredJid) {
     try {
       const sent = await sendToPreferredOrMsisdnVariants(
@@ -2544,7 +2640,7 @@ app.post("/send", async (req, res) => {
         digits,
         companyId
       )
-      tlog(companyId, "[OUTBOUND USING remoteJid]", preferredJid)
+      tlog(companyId, "[OUTBOUND USING preferredJid]", preferredJid)
       if (req.body.source !== "ai") {
         await saveMessageToDb(persistPhone, "out", plainSendText, "web", companyId, null, null)
         req._msgSaved = true;
@@ -2557,14 +2653,7 @@ app.post("/send", async (req, res) => {
         key: sent?.key || null,
       })
     } catch (ePref) {
-      if (String(preferredJid || "").endsWith("@lid")) {
-        console.warn("[OUTBOUND @lid same-thread error, no MSISDN fallback]", ePref?.message || ePref)
-        return res.status(502).json({
-          error: "send_failed",
-          detail: String(ePref?.message || ePref || "lid_send_failed"),
-        })
-      }
-      console.warn("[OUTBOUND remoteJid failed, falling back to MSISDN]", ePref?.message || ePref)
+      console.warn("[OUTBOUND preferredJid failed, falling back to MSISDN]", preferredJid, ePref?.message || ePref)
     }
   }
 
@@ -2645,7 +2734,7 @@ app.post("/sendMedia", async (req, res) => {
   if (!buffer || buffer.length === 0) return res.status(400).json({ error: "invalid_base64" })
 
   const candidates = buildWhatsAppPhoneCandidates(digits)
-  const preferredJidMedia = outboundJidFromRequestBody(req.body)
+  let preferredJidMedia = outboundJidFromRequestBody(req.body)
 
   const mm = mimetype.toLowerCase()
   const mediaType = mediaTypeFromMime(mm)
@@ -2692,8 +2781,12 @@ app.post("/sendMedia", async (req, res) => {
   }
 
   let lastErr = null
-  if (preferredJidMedia) {
+  if (false && preferredJidMedia) {
     try {
+      const fallbackPhone = digits
+      if (preferredJidMedia?.endsWith("@lid") && fallbackPhone) {
+        preferredJidMedia = `${fallbackPhone}@s.whatsapp.net`
+      }
       const sent = await sendToPreferredOrMsisdnVariants(
         sock,
         preferredJidMedia,
