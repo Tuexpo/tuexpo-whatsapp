@@ -1506,6 +1506,27 @@ sock.ev.on("message-receipt.update", async (updates) => {
   }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    try {
+      const __rawMsgs = Array.isArray({ messages, type }?.messages) ? { messages, type }.messages : []
+      console.log("[B7 RAW messages.upsert]", {
+        type: { messages, type }?.type,
+        count: __rawMsgs.length,
+        keys: __rawMsgs.slice(0, 3).map(x => ({
+          remoteJid: x?.key?.remoteJid,
+          participant: x?.key?.participant,
+          fromMe: x?.key?.fromMe,
+          id: x?.key?.id,
+          hasMessage: !!x?.message,
+          messageKeys: x?.message ? Object.keys(x.message) : [],
+          remoteJidAlt: x?.key?.remoteJidAlt,
+          participantAlt: x?.key?.participantAlt,
+          senderPn: x?.message?.senderPn,
+          participantPn: x?.message?.participantPn,
+        }))
+      })
+    } catch (e) {
+      console.warn("[B7 RAW messages.upsert logger failed]", e?.message || e)
+    }
     if (type !== 'notify') return
 
     const msgData = messages?.[0]
