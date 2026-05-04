@@ -185,6 +185,66 @@ const receiptBurstByKey = new Map()
 const RECEIPT_BURST_WINDOW_MS = 22_000
 const RECEIPT_BURST_THRESHOLD = 14
 
+// Inbound text debounce: evita 2-3 respuestas cuando el cliente manda varios mensajes seguidos.
+// Solo aplica a inbound texto normal. No aplica a media/audio, quoted/swipe, fromMe ni eventos especiales.
+const inboundDebounceByKey = new Map()
+const INBOUND_DEBOUNCE_MS = Number(process.env.INBOUND_DEBOUNCE_MS || 6500)
+
+function debounceIncomingToFlask(key, flaskBody, postFn) {
+  if (!key || !flaskBody || flaskBody.fromMe || flaskBody.media_type || flaskBody.quoted_id) {
+    return postFn(flaskBody)
+  }
+
+  const incomingText = String(flaskBody.text || flaskBody.message || "").trim()
+  if (!incomingText) return postFn(flaskBody)
+
+  let slot = inboundDebounceByKey.get(key)
+
+  if (slot) {
+    clearTimeout(slot.timer)
+    for (const resolve of slot.waiters || []) {
+      resolve({ data: { response: null, debounced: true } })
+    }
+    slot.waiters = []
+  } else {
+    slot = { parts: [], waiters: [], timer: null, lastBody: null }
+  }
+
+  slot.parts.push(incomingText)
+  slot.lastBody = {
+    ...flaskBody,
+    text: slot.parts.join("\n"),
+    message: slot.parts.join("\n"),
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    slot.waiters.push(resolve)
+    slot.timer = setTimeout(async () => {
+      inboundDebounceByKey.delete(key)
+      try {
+        console.log("[INBOUND DEBOUNCE FLUSH]", {
+          key,
+          parts: slot.parts.length,
+          chars: String(slot.lastBody?.text || "").length,
+        })
+        const res = await postFn(slot.lastBody)
+        resolve(res)
+      } catch (e) {
+        reject(e)
+      }
+    }, INBOUND_DEBOUNCE_MS)
+  })
+
+  inboundDebounceByKey.set(key, slot)
+
+  if (inboundDebounceByKey.size > 2000) {
+    const keys = Array.from(inboundDebounceByKey.keys()).slice(0, 500)
+    for (const k of keys) inboundDebounceByKey.delete(k)
+  }
+
+  return promise
+}
+
 /** connection.update close: varios cierres seguidos (WhatsApp o sesión inestable). */
 const closeTimestampsByTenant = new Map()
 const CLOSE_STORM_WINDOW_MS = 120_000
@@ -1973,7 +2033,16 @@ sock.ev.on("message-receipt.update", async (updates) => {
         flaskBody.media_base64 = persist.mediaBase64
         flaskBody.ptt = persist.ptt === true
       }
-      const res = await axios.post(TUEXPO_WHATSAPP_INCOMING_URL, flaskBody)
+      const inboundDebounceKey =
+        (!fromMe && !flaskBody.media_type && !flaskBody.quoted_id && phoneForWebhook)
+          ? `${sessionCompanyId}:${phoneForWebhook}`
+          : ""
+
+      const res = await debounceIncomingToFlask(
+        inboundDebounceKey,
+        flaskBody,
+        (body) => axios.post(TUEXPO_WHATSAPP_INCOMING_URL, body)
+      )
 
 
       tlog(tenantId, "← Respuesta de Flask:", res.data)
