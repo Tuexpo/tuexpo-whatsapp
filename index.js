@@ -2370,9 +2370,11 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
       }
 
-      // 🚗 Inventario: hasta 3 fotos (por response_images, no por response_type: con TTS sigue siendo "audio" + imágenes)
+      // 🚗 Inventario: fotos por response_images.
+      // Guard Riva: dedupe por URL + caption fallback para evitar "(imagem)" y doble envío visual.
       if (Array.isArray(res?.data?.response_images) && res.data.response_images.length) {
         let sentSomething = false
+        const sentImageUrls = new Set()
         const intro = String(reply || "").trim()
         if (intro) {
           try {
@@ -2386,8 +2388,20 @@ sock.ev.on("message-receipt.update", async (updates) => {
         for (const item of res.data.response_images) {
           const imageUrl = String(item?.image_url ?? "").trim()
           if (!imageUrl) continue
+
+          if (sentImageUrls.has(imageUrl)) {
+            tlog(tenantId, "🧯 Duplicate response_image skipped:", imageUrl.slice(-60))
+            continue
+          }
+          sentImageUrls.add(imageUrl)
+
           try {
-            const cap = String(item?.caption ?? "").trim()
+            const title = String(item?.title || "").trim()
+            const subtitle = String(item?.subtitle || "").trim()
+            let cap = String(item?.caption ?? "").trim()
+            if (!cap && title && subtitle) cap = `${title} — ${subtitle}`
+            else if (!cap && title) cap = title
+
             const mediaType = String(item?.media_type ?? "image").trim()
             if (mediaType === "video") {
               await sendReplyTransport({ video: { url: imageUrl }, caption: cap })
@@ -2395,7 +2409,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
             } else {
               await sendWhatsappImage(imageUrl, cap, {
                 automotive_vehicle: {
-                  title: String(item?.title || "").trim() || cap.split("—")[0]?.trim() || "",
+                  title: title || cap.split("—")[0]?.trim() || "",
                   brand: String(item?.brand || "").trim(),
                   model: String(item?.model || "").trim(),
                   year_model: String(item?.year_model || "").trim(),
