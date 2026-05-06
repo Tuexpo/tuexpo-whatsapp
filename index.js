@@ -164,6 +164,13 @@ const sessions = {} // { [companyId]: sock }
 const qrStore = {} // { [companyId]: qrString|null }
 const statusStore = {} // { [companyId]: connected|disconnected|waiting_qr|connecting|unknown }
 const qrUpdatedAtStore = {} // { [companyId]: msTimestamp }
+/**
+ * QR_POLICY_GLOBAL:
+ * - QR solo se permite cuando un humano presiona "Reconectar / Generar QR" (/connect).
+ * - Autostart/reconnect/lazy-start pueden recuperar sesión existente, pero no abrir QR infinito.
+ */
+const qrAllowedUntilStore = {} // { [companyId]: msTimestamp }
+const reconnectBlockedUntilStore = {} // { [companyId]: msTimestamp }
 const connectInProgress = {} // { [companyId]: boolean }
 const reconnectTimers = {} // { [companyId]: timeoutHandle|null }
 const socketGeneration = {} // { [companyId]: number }
@@ -1310,6 +1317,10 @@ function tenantFromRequest(req) {
 async function startWhatsApp(companyId, forceNew = false) {
   await loadBaileys()
   const tenantId = parseInt(String(companyId), 10) || 1
+
+  if (!forceNew) {
+    delete qrAllowedUntilStore[tenantId]
+  }
   if (!isTenantEnabled(tenantId)) {
     statusStore[tenantId] = "disabled"
     return null
@@ -1388,6 +1399,25 @@ async function startWhatsApp(companyId, forceNew = false) {
     const { connection, qr, lastDisconnect } = update
 
     if (qr) {
+      const qrAllowedUntil = Number(qrAllowedUntilStore[tenantId] || 0)
+      const qrAllowed = qrAllowedUntil > Date.now()
+
+      if (!qrAllowed) {
+        qrStore[tenantId] = null
+        qrUpdatedAtStore[tenantId] = Date.now()
+        statusStore[tenantId] = "disconnected"
+        reconnectBlockedUntilStore[tenantId] = Date.now() + 10 * 60 * 1000
+
+        console.warn(
+          `[QR_POLICY] tenant ${tenantId}: QR bloqueado porque no fue disparado por POST /connect. Esperando botón Reconectar / Generar QR.`
+        )
+
+        try { sock.ws?.close() } catch (_) {}
+        try { sock.end?.() } catch (_) {}
+
+        return
+      }
+
       qrStore[tenantId] = qr
       qrUpdatedAtStore[tenantId] = Date.now()
       statusStore[tenantId] = "waiting_qr"
@@ -1401,6 +1431,8 @@ async function startWhatsApp(companyId, forceNew = false) {
       qrStore[tenantId] = null
       qrUpdatedAtStore[tenantId] = Date.now()
       reconnectAttemptByTenant[tenantId] = 0
+      delete qrAllowedUntilStore[tenantId]
+      delete reconnectBlockedUntilStore[tenantId]
       if (reconnectTimers[tenantId]) {
         clearTimeout(reconnectTimers[tenantId])
         reconnectTimers[tenantId] = null
@@ -1408,9 +1440,40 @@ async function startWhatsApp(companyId, forceNew = false) {
     }
 
     if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode
+      const errMsg = String(
+        lastDisconnect?.error?.message ||
+          lastDisconnect?.error?.output?.payload?.message ||
+          lastDisconnect?.error?.data ||
+          ""
+      )
+
+      const reconnectBlockedUntil = Number(reconnectBlockedUntilStore[tenantId] || 0)
+      if (reconnectBlockedUntil > Date.now()) {
+        tlog(tenantId, `Conexión cerrada (tenant ${tenantId}) QR bloqueado; sin auto-reconnect`)
+        statusStore[tenantId] = "disconnected"
+        return
+      }
+
+      const qrRefsAttemptsEnded = (
+        statusCode === 408 &&
+        /QR refs attempts ended/i.test(errMsg)
+      )
+
+      if (qrRefsAttemptsEnded) {
+        qrStore[tenantId] = null
+        qrUpdatedAtStore[tenantId] = Date.now()
+        statusStore[tenantId] = "disconnected"
+        delete qrAllowedUntilStore[tenantId]
+        reconnectBlockedUntilStore[tenantId] = Date.now() + 10 * 60 * 1000
+        console.warn(
+          `[QR_POLICY] tenant ${tenantId}: QR expiró/no fue escaneado. No se auto-reconecta; esperar nuevo POST /connect.`
+        )
+        return
+      }
 
       const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+        statusCode !== DisconnectReason.loggedOut
 
       tlog(tenantId, `Conexión cerrada (tenant ${tenantId})`)
       statusStore[tenantId] = "disconnected"
@@ -1984,11 +2047,14 @@ sock.ev.on("message-receipt.update", async (updates) => {
         remoteJid: webhookChatJid,
         rawRemoteJid: remoteJid,
       }
-      if (persist.mediaType === "audio" && persist.mediaBase64) {
-        logPayload.media_type = "audio"
-        logPayload.mime_type = persist.mimeType
+      if (persist.mediaType) {
+        logPayload.media_type = persist.mediaType
+        logPayload.media_url = persist.mediaUrl || null
+        logPayload.mime_type = persist.mimeType || null
         logPayload.ptt = persist.ptt
-        logPayload.media_base64 = `<${persist.mediaBase64.length} chars>`
+        if (persist.mediaType === "audio" && persist.mediaBase64) {
+          logPayload.media_base64 = `<${persist.mediaBase64.length} chars>`
+        }
       }
       tlog(tenantId, "WEBHOOK PAYLOAD:", logPayload)
       const participantMsisdn = (() => {
@@ -2027,11 +2093,15 @@ sock.ev.on("message-receipt.update", async (updates) => {
         quoted_id: quotedId,
         catalog_stanza_ids: catalogMessageIdsByTenant[sessionCompanyId] || [],
       }
-      if (persist.mediaType === "audio" && persist.mediaBase64) {
-        flaskBody.media_type = "audio"
-        flaskBody.mime_type = persist.mimeType || "audio/ogg; codecs=opus"
-        flaskBody.media_base64 = persist.mediaBase64
+      if (persist.mediaType) {
+        flaskBody.media_type = persist.mediaType
+        flaskBody.media_url = persist.mediaUrl || null
+        flaskBody.mime_type = persist.mimeType || null
         flaskBody.ptt = persist.ptt === true
+        if (persist.mediaType === "audio" && persist.mediaBase64) {
+          flaskBody.media_base64 = persist.mediaBase64
+          flaskBody.mime_type = persist.mimeType || "audio/ogg; codecs=opus"
+        }
       }
       const inboundDebounceKey =
         (!fromMe && !flaskBody.media_type && !flaskBody.quoted_id && phoneForWebhook)
@@ -2512,6 +2582,10 @@ app.post("/connect", async (req, res) => {
     qrStore[companyId] = null
     statusStore[companyId] = "waiting_qr"
     qrUpdatedAtStore[companyId] = Date.now()
+
+    // Ventana de QR abierta únicamente por acción humana desde panel/settings.
+    qrAllowedUntilStore[companyId] = Date.now() + 2 * 60 * 1000
+    delete reconnectBlockedUntilStore[companyId]
 
     await startWhatsApp(companyId, true)
     res.json({ company_id: companyId, status: "waiting_qr" })
