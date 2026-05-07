@@ -1961,6 +1961,60 @@ sock.ev.on("message-receipt.update", async (updates) => {
           password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
           database: "tuexpo_voice",
         })
+        // fromMe/mobile: nunca guardar el LID desnudo como phone.
+        // Si el chat viene como @lid y el phone resuelto es el localpart del LID,
+        // intentamos resolverlo contra contacts.wa_relay_jid. Si no existe MSISDN real, no persistimos.
+        const mobileOriginalPhone = String(phone || "").replace(/\D/g, "")
+        const mobileLidJid = (
+          String(remoteJid || "").trim().endsWith("@lid")
+            ? String(remoteJid || "").trim()
+            : (
+                String(canonicalRemoteJid || "").trim().endsWith("@lid")
+                  ? String(canonicalRemoteJid || "").trim()
+                  : ""
+              )
+        )
+        const mobileLidDigits = mobileLidJid ? waLocalDigitsFromLidJid(mobileLidJid) : ""
+        if (
+          mobileLidJid &&
+          mobileOriginalPhone &&
+          mobileLidDigits &&
+          mobileOriginalPhone === mobileLidDigits
+        ) {
+          const [relayRows] = await db.execute(
+            `SELECT phone
+               FROM contacts
+              WHERE tenant_id = ?
+                AND wa_relay_jid IS NOT NULL
+                AND TRIM(wa_relay_jid) <> ''
+                AND (
+                  TRIM(wa_relay_jid) = ?
+                  OR SUBSTRING_INDEX(SUBSTRING_INDEX(TRIM(wa_relay_jid), '@', 1), ':', 1) = ?
+                )
+                AND phone <> ?
+              ORDER BY updated_at DESC
+              LIMIT 1`,
+            [sessionCompanyId, mobileLidJid, mobileLidDigits, mobileOriginalPhone]
+          )
+
+          const mappedPhone = String((relayRows && relayRows[0] && relayRows[0].phone) || "").replace(/\D/g, "")
+          if (mappedPhone) {
+            phone = mappedPhone
+            tlog(tenantId, "[FROMME MOBILE LID RESOLVED]", {
+              lid: mobileLidJid,
+              from: mobileOriginalPhone,
+              to: mappedPhone
+            })
+          } else {
+            console.warn("[FROMME MOBILE LID BLOCKED]", {
+              tenantId: sessionCompanyId,
+              phone: mobileOriginalPhone,
+              lid: mobileLidJid
+            })
+            return
+          }
+        }
+
         try {
           await db.execute(
             `INSERT INTO messages (phone, tenant_id, company_id, direction, message, source)
@@ -1978,6 +2032,10 @@ sock.ev.on("message-receipt.update", async (updates) => {
             throw eInsert
           }
         }
+
+        // Mobile/fromMe messages are persisted above as source='mobile'.
+        // Do NOT mutate conversation_state here.
+        // Response mode is owned only by Flask/backend response_mode.
       } catch (err) {
         console.error("outbound message DB save failed", err.message)
       } finally {
