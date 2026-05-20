@@ -1318,7 +1318,7 @@ async function startWhatsApp(companyId, forceNew = false) {
   await loadBaileys()
   const tenantId = parseInt(String(companyId), 10) || 1
 
-  if (!forceNew) {
+  if (!forceNew && statusStore[tenantId] !== "waiting_qr") {
     delete qrAllowedUntilStore[tenantId]
   }
   if (!isTenantEnabled(tenantId)) {
@@ -1340,7 +1340,12 @@ async function startWhatsApp(companyId, forceNew = false) {
 
   if (sessions[tenantId]) {
     try {
-      await sessions[tenantId].logout()
+      if (forceNew) {
+        await sessions[tenantId].logout()
+      } else {
+        try { sessions[tenantId].ws?.close() } catch (_) {}
+        try { sessions[tenantId].end?.() } catch (_) {}
+      }
     } catch (e) {
       // ignore
     }
@@ -1475,8 +1480,37 @@ async function startWhatsApp(companyId, forceNew = false) {
       const shouldReconnect =
         statusCode !== DisconnectReason.loggedOut
 
-      tlog(tenantId, `Conexión cerrada (tenant ${tenantId})`)
-      statusStore[tenantId] = "disconnected"
+      tlog(
+        tenantId,
+        `Conexión cerrada (tenant ${tenantId}) statusCode=${statusCode || "unknown"} err=${errMsg.slice(0, 180) || "none"}`
+      )
+
+      const qrStillValid =
+        !!qrStore[tenantId] &&
+        Number(qrAllowedUntilStore[tenantId] || 0) > Date.now()
+
+      if (qrStillValid) {
+        statusStore[tenantId] = "waiting_qr"
+        console.warn(
+          `[QR_POLICY] tenant ${tenantId}: socket closed while QR is still valid; keeping status waiting_qr`
+        )
+      } else {
+        statusStore[tenantId] = "disconnected"
+      }
+
+      if (statusCode === 515 && qrStillValid) {
+        console.warn(
+          `[QR_POLICY] tenant ${tenantId}: statusCode=515 restart required during QR; restarting socket once without deleting QR window`
+        )
+        if (reconnectTimers[tenantId]) clearTimeout(reconnectTimers[tenantId])
+        reconnectTimers[tenantId] = setTimeout(() => {
+          if (socketGeneration[tenantId] !== gen) return
+          startWhatsApp(tenantId, false).catch((err) => {
+            console.error(`qr restart 515 failed tenant ${tenantId}:`, err.message || err)
+          })
+        }, 1200)
+        return
+      }
 
       const boomMsg = String(
         lastDisconnect?.error?.message ||
@@ -1956,10 +1990,10 @@ sock.ev.on("message-receipt.update", async (updates) => {
       let db
       try {
         db = await mysql.createConnection({
-          host: "localhost",
-          user: "root",
-          password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
-          database: "tuexpo_voice",
+          host: process.env.DB_HOST || "127.0.0.1",
+          user: process.env.DB_USER || "root",
+          password: process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+          database: process.env.DB_NAME || "tuexpo_voice",
         })
         // fromMe/mobile: nunca guardar el LID desnudo como phone.
         // Si el chat viene como @lid y el phone resuelto es el localpart del LID,
@@ -2015,23 +2049,43 @@ sock.ev.on("message-receipt.update", async (updates) => {
           }
         }
 
+        const finalMobilePhone = String(phone || "").replace(/\D/g, "")
+        if (!finalMobilePhone) {
+          console.warn("[FROMME MOBILE BLOCKED: missing phone]", {
+            tenantId: sessionCompanyId,
+            remoteJid,
+            canonicalRemoteJid,
+            msgKeyId,
+            message: String(message || "").slice(0, 120)
+          })
+          return
+        }
+
         try {
           await db.execute(
             `INSERT INTO messages (phone, tenant_id, company_id, direction, message, source)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [phone, sessionCompanyId, sessionCompanyId, "out", message || "", "mobile"]
+            [finalMobilePhone, sessionCompanyId, sessionCompanyId, "out", message || "", "mobile"]
           )
         } catch (eInsert) {
           if (String(eInsert?.message || "").toLowerCase().includes("company_id")) {
             await db.execute(
               `INSERT INTO messages (phone, tenant_id, direction, message, source)
                VALUES (?, ?, ?, ?, ?)`,
-              [phone, sessionCompanyId, "out", message || "", "mobile"]
+              [finalMobilePhone, sessionCompanyId, "out", message || "", "mobile"]
             )
           } else {
             throw eInsert
           }
         }
+
+        tlog(tenantId, "[FROMME MOBILE SAVED]", {
+          tenantId: sessionCompanyId,
+          phone: finalMobilePhone,
+          msgKeyId,
+          chars: String(message || "").length,
+          preview: String(message || "").slice(0, 80)
+        })
 
         // Mobile/fromMe messages are persisted above as source='mobile'.
         // Do NOT mutate conversation_state here.
@@ -3137,9 +3191,10 @@ app.post("/sendMedia", async (req, res) => {
   })
 })
 
-app.listen(3015, async () => {
+const PORT = Number(process.env.PORT || 3016)
+app.listen(PORT, async () => {
 
-  console.log("Tuexpo WhatsApp connector iniciado en puerto 3015")
+  console.log(`Tuexpo WhatsApp connector iniciado en puerto ${PORT}`)
   await loadBaileys()
   const panelSecret = panelBaileysSecretFromEnvFile()
   if (panelSecret !== BAILEYS_WEBHOOK_SECRET) {
