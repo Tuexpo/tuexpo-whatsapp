@@ -1053,6 +1053,55 @@ async function saveMessageToDb(
   }
 }
 
+
+async function lookupAutomotiveVehicleByStanzaId(tenantId, stanzaId) {
+  const sid = String(stanzaId || "").trim()
+  if (!sid) return null
+  let db
+  try {
+    db = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: process.env.MYSQL_PASSWORD || "PasswordSeguro123",
+      database: "tuexpo_voice",
+    })
+    const [rows] = await db.execute(
+      `SELECT meta_json
+         FROM messages
+        WHERE tenant_id = ?
+          AND direction = 'out'
+          AND media_type IN ('image', 'affiliate_product')
+          AND meta_json IS NOT NULL
+          AND JSON_UNQUOTE(JSON_EXTRACT(meta_json, '$.stanza_id')) = ?
+        ORDER BY id DESC
+        LIMIT 1`,
+      [Number(tenantId) || 1, sid]
+    )
+    if (!rows || !rows.length) return null
+    const raw = rows[0]?.meta_json
+    const meta = typeof raw === "string" ? JSON.parse(raw) : raw
+    if (!meta || !meta.automotive_inventory) return null
+    return {
+      quoted_stanza_id: sid,
+      id_vehicle: meta.id_vehicle || null,
+      title: meta.title || "",
+      brand: meta.brand || "",
+      model: meta.model || "",
+      year_model: meta.year_model || "",
+      price: meta.price_brl || "",
+      image_url: meta.image_url || "",
+      images: Array.isArray(meta.images) ? meta.images : [],
+      source: meta.source || "bndv_inventory",
+    }
+  } catch (err) {
+    console.warn("[quoted_stanza_lookup_failed]", sid, err.message || err)
+    return null
+  } finally {
+    if (db) await db.end()
+  }
+}
+
+
 function mediaTypeFromMime(mime) {
   const mm = String(mime || "").toLowerCase()
   if (mm.startsWith("image/")) return "image"
@@ -1978,6 +2027,10 @@ sock.ev.on("message-receipt.update", async (updates) => {
             throw eInsert
           }
         }
+
+        // Mobile/fromMe messages are persisted above as source='mobile'.
+        // Do NOT mutate conversation_state here.
+        // Response mode is owned only by Flask/backend response_mode.
       } catch (err) {
         console.error("outbound message DB save failed", err.message)
       } finally {
@@ -2063,6 +2116,12 @@ sock.ev.on("message-receipt.update", async (updates) => {
         return normalizeMxDigits(p.replace("@s.whatsapp.net", "").replace(/\D/g, ""))
       })()
       const phoneForWebhook = String(resolvedPhone || participantMsisdn || webhookPhone || "").trim()
+      const quotedAutomotiveVehicle = quotedId
+        ? await lookupAutomotiveVehicleByStanzaId(sessionCompanyId, quotedId)
+        : null
+      if (quotedAutomotiveVehicle) {
+        tlog(tenantId, "[QUOTED AUTOMOTIVE VEHICLE RESOLVED]", quotedAutomotiveVehicle)
+      }
       const k = msgData.key || {}
       const flaskBody = {
         phone: phoneForWebhook,
@@ -2089,6 +2148,9 @@ sock.ev.on("message-receipt.update", async (updates) => {
         fromMe,
         text: textForBrain,
         message: textForBrain,
+        quoted_stanza_id: quotedId || null,
+        quoted_automotive_vehicle: quotedAutomotiveVehicle || null,
+        quoted_vehicle_id: quotedAutomotiveVehicle?.id_vehicle || null,
         // Swipe / reply: panel + automotive_brain (resolve_product_from_stanza + catalog_stanza_ids).
         quoted_id: quotedId,
         catalog_stanza_ids: catalogMessageIdsByTenant[sessionCompanyId] || [],
@@ -2279,12 +2341,14 @@ sock.ev.on("message-receipt.update", async (updates) => {
           Object.assign(metaObj, {
             automotive_inventory: true,
             source: "bndv_inventory",
+            id_vehicle: av.id_vehicle != null && av.id_vehicle !== "" ? String(av.id_vehicle) : undefined,
             title: av.title ? String(av.title) : undefined,
             brand: av.brand ? String(av.brand) : undefined,
             model: av.model ? String(av.model) : undefined,
             year_model: av.year_model ? String(av.year_model) : undefined,
             price_brl: av.price_brl != null && av.price_brl !== "" ? String(av.price_brl) : undefined,
             image_url: imageUrl,
+            images: Array.isArray(av.images) ? av.images : undefined,
             persisted_at: new Date().toISOString(),
           })
         }
@@ -2479,11 +2543,13 @@ sock.ev.on("message-receipt.update", async (updates) => {
             } else {
               await sendWhatsappImage(imageUrl, cap, {
                 automotive_vehicle: {
+                  id_vehicle: item?.id_vehicle != null ? String(item.id_vehicle) : "",
                   title: title || cap.split("—")[0]?.trim() || "",
                   brand: String(item?.brand || "").trim(),
                   model: String(item?.model || "").trim(),
                   year_model: String(item?.year_model || "").trim(),
                   price_brl: item?.price != null ? String(item.price) : "",
+                  images: Array.isArray(item?.images) ? item.images : [],
                 },
               })
             }
