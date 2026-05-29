@@ -2015,18 +2015,65 @@ sock.ev.on("message-receipt.update", async (updates) => {
           }
         }
 
+        let mobilePersist = { mediaType: null, mediaUrl: null, mimeType: null, ptt: null, mediaBase64: null }
+        if (hasMedia) {
+          try {
+            mobilePersist = await persistIncomingMedia(sock, msgData, sessionCompanyId)
+            if (mobilePersist && mobilePersist.mediaType) {
+              tlog(tenantId, "[FROMME MOBILE MEDIA PERSISTED]", {
+                media_type: mobilePersist.mediaType,
+                media_url: mobilePersist.mediaUrl || null,
+                mime_type: mobilePersist.mimeType || null,
+                ptt: mobilePersist.ptt === true
+              })
+            }
+          } catch (mediaErr) {
+            console.warn("[FROMME MOBILE MEDIA PERSIST FAILED]", mediaErr?.message || mediaErr)
+          }
+        }
+
+        const mobileMetaJson = JSON.stringify({
+          wa_key_id: msgKeyId || null,
+          key_id: msgKeyId || null,
+          remoteJid: canonicalRemoteJid || remoteJid || null,
+          rawRemoteJid: msgData?.key?.remoteJid || remoteJid || null,
+          fromMe: true,
+          source: "mobile",
+          mime_type: mobilePersist.mimeType || null,
+          ptt: mobilePersist.ptt === true
+        })
+
         try {
           await db.execute(
-            `INSERT INTO messages (phone, tenant_id, company_id, direction, message, source)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [phone, sessionCompanyId, sessionCompanyId, "out", message || "", "mobile"]
+            `INSERT INTO messages (phone, tenant_id, company_id, direction, message, source, media_type, media_url, meta_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              phone,
+              sessionCompanyId,
+              sessionCompanyId,
+              "out",
+              message || "",
+              "mobile",
+              mobilePersist.mediaType || null,
+              mobilePersist.mediaUrl || null,
+              mobileMetaJson
+            ]
           )
         } catch (eInsert) {
           if (String(eInsert?.message || "").toLowerCase().includes("company_id")) {
             await db.execute(
-              `INSERT INTO messages (phone, tenant_id, direction, message, source)
-               VALUES (?, ?, ?, ?, ?)`,
-              [phone, sessionCompanyId, "out", message || "", "mobile"]
+              `INSERT INTO messages (phone, tenant_id, direction, message, source, media_type, media_url, meta_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                phone,
+                sessionCompanyId,
+                "out",
+                message || "",
+                "mobile",
+                mobilePersist.mediaType || null,
+                mobilePersist.mediaUrl || null,
+                mobileMetaJson
+              ]
             )
           } else {
             throw eInsert
