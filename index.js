@@ -1748,6 +1748,58 @@ sock.ev.on("message-receipt.update", async (updates) => {
 
     const m = msgData.message || {}
 
+    // CTWA / Meta Ads referral capture.
+    // Do not infer Instagram/Facebook by campaign phrase.
+    // Only persist real Baileys contextInfo.externalAdReply when WhatsApp provides it.
+    function pickFirstExternalAdReply(messageObj) {
+      const roots = [
+        messageObj?.conversation,
+        messageObj?.extendedTextMessage,
+        messageObj?.imageMessage,
+        messageObj?.videoMessage,
+        messageObj?.documentMessage,
+        messageObj?.audioMessage,
+        messageObj?.buttonsResponseMessage,
+        messageObj?.listResponseMessage,
+        messageObj?.templateButtonReplyMessage,
+        messageObj?.interactiveResponseMessage,
+      ];
+
+      for (const node of roots) {
+        const ctx = node?.contextInfo;
+        const ad = ctx?.externalAdReply;
+        if (ad && typeof ad === "object") {
+          return {
+            externalAdReply: ad,
+            ctwaClid: ad.ctwaClid || ad.ctwa_clid || null,
+            sourceApp: ad.sourceApp || ad.source_app || null,
+            sourceType: ad.sourceType || ad.source_type || null,
+            sourceId: ad.sourceId || ad.source_id || null,
+            sourceUrl: ad.sourceUrl || ad.source_url || null,
+            title: ad.title || null,
+            body: ad.body || null,
+            mediaType: ad.mediaType || ad.media_type || null,
+            thumbnailUrl: ad.thumbnailUrl || ad.thumbnail_url || null,
+            containsAutoReply: ad.containsAutoReply || ad.contains_auto_reply || null,
+          };
+        }
+      }
+
+      return null;
+    }
+
+    const waAdReferral = pickFirstExternalAdReply(m);
+    if (waAdReferral) {
+      tlog(tenantId, "[CTWA AD REFERRAL DETECTED]", {
+        ctwaClid: waAdReferral.ctwaClid || null,
+        sourceApp: waAdReferral.sourceApp || null,
+        sourceType: waAdReferral.sourceType || null,
+        sourceId: waAdReferral.sourceId || null,
+        sourceUrl: waAdReferral.sourceUrl || null,
+        title: waAdReferral.title || null,
+      });
+    }
+
     // DETECTAR RESPUESTA CITADA (swipe / reply) — stanzaId para inventario automotive + Menz.
     const quotedId =
       m?.extendedTextMessage?.contextInfo?.stanzaId ||
@@ -2201,6 +2253,7 @@ sock.ev.on("message-receipt.update", async (updates) => {
         // Swipe / reply: panel + automotive_brain (resolve_product_from_stanza + catalog_stanza_ids).
         quoted_id: quotedId,
         catalog_stanza_ids: catalogMessageIdsByTenant[sessionCompanyId] || [],
+        wa_ad_referral: waAdReferral || null,
       }
       if (persist.mediaType) {
         flaskBody.media_type = persist.mediaType
